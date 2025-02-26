@@ -598,9 +598,30 @@ def train_model_worker(model_name, n_episodes, evaluation_parameter, gamma, batc
         # Import needed here since this runs in a separate process
         import gc
         import time
+        import sys
+        import os
         
-        # Get instance attribute by name
-        from __main__ import run
+        # Add the project directory to the path so we can import modules
+        sys.path.append(os.getcwd())
+        
+        # Import the main module
+        import Main
+        
+        # Create a new instance for this process
+        run = Main.SensitivityRun(
+            Main.args.dataset_name,
+            gamma,
+            batch_size,
+            replay_memory_size,
+            64,  # feature_size
+            5,   # target_update
+            n_episodes,
+            8,   # n_step
+            Main.args.window_size,
+            "cpu",  # Each process should use CPU
+            evaluation_parameter,
+            0    # transaction_cost
+        )
         
         print(f"Training {model_name} ...")
         model = getattr(run, model_name)
@@ -609,22 +630,34 @@ def train_model_worker(model_name, n_episodes, evaluation_parameter, gamma, batc
         # Test immediately to get portfolio values
         portfolio = model.test().get_daily_portfolio_value()
         
-        # Determine which key to use based on evaluation parameter
-        key = None
-        if evaluation_parameter == 'gamma':
-            key = gamma
-        elif evaluation_parameter == 'batch size':
-            key = batch_size
-        elif evaluation_parameter == 'replay memory size':
-            key = replay_memory_size
+        # Map model names to display names in test_portfolios dictionary
+        model_display_map = {
+            'dqn_pattern': 'DQN-pattern',
+            'dqn_vanilla': 'DQN-vanilla',
+            'dqn_windowed': 'DQN-windowed',
+            'mlp_pattern': 'MLP-pattern',
+            'mlp_vanilla': 'MLP-vanilla',
+            'mlp_windowed': 'MLP-windowed',
+            'cnn1d': 'CNN1d',
+            'cnn2d': 'CNN2d',
+            'gru': 'GRU',
+            'cnn_attn': 'CNN-ATTN',
+            'cnn_gru': 'CNN-GRU'
+        }
         
-        # Simpler conversion since we don't have special cases anymore
-        display_name = model_name.replace('_', '-').upper()
+        display_name = model_display_map.get(model_name, model_name)
+        
+        # Determine which key to use based on evaluation parameter
+        key = gamma if evaluation_parameter == 'gamma' else \
+              batch_size if evaluation_parameter == 'batch size' else \
+              replay_memory_size
         
         print(f"Complete {model_name}")
         return model_name, display_name, key, portfolio
     except Exception as e:
+        import traceback
         print(f"Error training {model_name}: {e}")
+        traceback.print_exc()
         return model_name, None, None, None
 
 if __name__ == '__main__':
