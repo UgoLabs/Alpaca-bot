@@ -523,39 +523,22 @@ class SensitivityRun:
             ['cnn1d', 'cnn2d', 'gru', 'cnn_attn', 'cnn_gru']  # Kept cnn_gru
         ]
         
-        # Helper function to train one model
-        def train_model(model_name):
-            try:
-                print(f"Training {model_name} ...")
-                model = getattr(self, model_name)
-                model.train(self.n_episodes)
-                
-                # Test immediately to get portfolio values
-                portfolio = model.test().get_daily_portfolio_value()
-                
-                # Determine which key to use based on evaluation parameter
-                key = None
-                if self.evaluation_parameter == 'gamma':
-                    key = self.gamma
-                elif self.evaluation_parameter == 'batch size':
-                    key = self.batch_size
-                elif self.evaluation_parameter == 'replay memory size':
-                    key = self.replay_memory_size
-                
-                # Simpler conversion since we don't have special cases anymore
-                display_name = model_name.replace('_', '-').upper()
-                
-                print(f"Complete {model_name}")
-                return model_name, display_name, key, portfolio
-            except Exception as e:
-                print(f"Error training {model_name}: {e}")
-                return model_name, None, None, None
-
         # Train each group of models in parallel
         for group_idx, model_group in enumerate(model_groups):
             print(f"Training group {group_idx+1}/{len(model_groups)}: {', '.join(model_group)}")
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(train_model, model_name): model_name for model_name in model_group}
+                futures = {}
+                for model_name in model_group:
+                    future = executor.submit(
+                        train_model_worker, 
+                        model_name, 
+                        self.n_episodes,
+                        self.evaluation_parameter,
+                        self.gamma,
+                        self.batch_size,
+                        self.replay_memory_size
+                    )
+                    futures[future] = model_name
                 
                 for future in as_completed(futures):
                     model_name, display_name, key, portfolio = future.result()
@@ -565,7 +548,7 @@ class SensitivityRun:
             # Force garbage collection between groups
             gc.collect()
             time.sleep(2)  # Give system time to clean up
-            
+        
         print("All models trained successfully")
 
     def plot_and_save_sensitivity(self):
@@ -608,6 +591,41 @@ class SensitivityRun:
         self.plot_and_save_sensitivity()
         self.save_portfolios()
 
+# Add this function at the module level, before the if __name__ == '__main__' line
+def train_model_worker(model_name, n_episodes, evaluation_parameter, gamma, batch_size, replay_memory_size):
+    """Standalone worker function for training models in parallel"""
+    try:
+        # Import needed here since this runs in a separate process
+        import gc
+        import time
+        
+        # Get instance attribute by name
+        from __main__ import run
+        
+        print(f"Training {model_name} ...")
+        model = getattr(run, model_name)
+        model.train(n_episodes)
+        
+        # Test immediately to get portfolio values
+        portfolio = model.test().get_daily_portfolio_value()
+        
+        # Determine which key to use based on evaluation parameter
+        key = None
+        if evaluation_parameter == 'gamma':
+            key = gamma
+        elif evaluation_parameter == 'batch size':
+            key = batch_size
+        elif evaluation_parameter == 'replay memory size':
+            key = replay_memory_size
+        
+        # Simpler conversion since we don't have special cases anymore
+        display_name = model_name.replace('_', '-').upper()
+        
+        print(f"Complete {model_name}")
+        return model_name, display_name, key, portfolio
+    except Exception as e:
+        print(f"Error training {model_name}: {e}")
+        return model_name, None, None, None
 
 if __name__ == '__main__':
     # Check API connection before proceeding
