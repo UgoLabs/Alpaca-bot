@@ -1,0 +1,29 @@
+{
+  "api": {
+    "alpaca": {
+      "use_paper": true,
+      "paper_base_url": "https://paper-api.alpaca.markets",
+      "live_base_url": "https://api.alpaca.markets",
+      "data_feed": "iex"
+    },
+    "finnhub": {
+      "base_url": "https://finnhub.io/api/v1"
+    },
+    "alpha_vantage": {
+      "base_url": "https://www.alphavantage.co/query"
+    },
+    "google": {
+      "credentials_file": "google_credentials.json"
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "alpaca_bot.log",
+    "max_size": 10485760,
+    "backup_count": 5
+  },
+  "trading": {
+    "default_symbols": ["AAPL", "MSFT", "AMZN", "GOOGL", "FB"],
+    "default_timeframe": "1D"
+  }
+}
