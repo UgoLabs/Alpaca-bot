@@ -1,0 +1,42 @@
+# Core dependencies
+python-dotenv>=0.19.0
+requests>=2.27.1
+pandas>=1.4.1
+numpy>=1.22.2
+scikit-learn>=1.0.2
+tensorflow>=2.8.0
+alpaca-trade-api>=2.1.0
+ta-lib>=0.4.24
+pytz>=2021.3
+mplfinance>=0.12.8
+matplotlib>=3.5.1
+seaborn>=0.11.2
+
+# API integrations
+finnhub-python>=2.4.14
+alpha_vantage>=2.3.1
+google-api-python-client>=2.36.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=0.4.6
+
+# Natural language processing
+nltk>=3.7
+vaderSentiment>=3.3.2
+transformers>=4.17.0
+torch>=1.11.0
+
+# Optimization and statistics
+scipy>=1.8.0
+statsmodels>=0.13.2
+cvxpy>=1.1.18
+
+# Web and utilities
+fastapi>=0.75.0
+uvicorn>=0.17.6
+pyyaml>=6.0
+tqdm>=4.63.0
+joblib>=1.1.0
+
+# Testing and development
+pytest>=7.0.1
+black>=22.1.0
