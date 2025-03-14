@@ -1,6 +1,0 @@
-{
-  "deployment_mode": "cloud",
-  "instance_type": "t2.micro",
-  "auto_scaling": true,
-  "alerts_email": "alerts@example.com"
-}
