@@ -1,0 +1,8 @@
+alpaca-trade-api
+pandas
+numpy
+torch
+gym
+python-dotenv
+yfinance
+pytz

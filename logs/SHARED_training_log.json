@@ -1,0 +1,902 @@
+[
+  {
+    "episode": 1,
+    "symbol": "NVDA",
+    "total_reward": 149.59999999999974,
+    "net_worth": 19469.135225892067,
+    "total_return": 94.69135225892067,
+    "sharpe": 5.425013746524076,
+    "trades": 108
+  },
+  {
+    "episode": 2,
+    "symbol": "AMD",
+    "total_reward": -11.600000000000243,
+    "net_worth": 14751.160643935204,
+    "total_return": 47.511606439352036,
+    "sharpe": 2.854554678511709,
+    "trades": 89
+  },
+  {
+    "episode": 3,
+    "symbol": "INTC",
+    "total_reward": 64.49999999999912,
+    "net_worth": 10355.704746246338,
+    "total_return": 3.5570474624633786,
+    "sharpe": 0.6436793924445967,
+    "trades": 91
+  },
+  {
+    "episode": 4,
+    "symbol": "TSM",
+    "total_reward": 321.89999999999924,
+    "net_worth": 13760.357392311096,
+    "total_return": 37.603573923110964,
+    "sharpe": 3.427309802750888,
+    "trades": 64
+  },
+  {
+    "episode": 5,
+    "symbol": "ASML",
+    "total_reward": 294.0000000000001,
+    "net_worth": 13157.119049072266,
+    "total_return": 31.571190490722657,
+    "sharpe": 4.053868543136418,
+    "trades": 65
+  },
+  {
+    "episode": 6,
+    "symbol": "AVGO",
+    "total_reward": 72.29999999999848,
+    "net_worth": 13646.95485496521,
+    "total_return": 36.469548549652096,
+    "sharpe": 2.605427879796666,
+    "trades": 75
+  },
+  {
+    "episode": 7,
+    "symbol": "TXN",
+    "total_reward": 236.99999999999844,
+    "net_worth": 11491.358675003052,
+    "total_return": 14.913586750030516,
+    "sharpe": 1.7333680527870563,
+    "trades": 65
+  },
+  {
+    "episode": 8,
+    "symbol": "QCOM",
+    "total_reward": 162.1999999999995,
+    "net_worth": 12389.56243133545,
+    "total_return": 23.895624313354492,
+    "sharpe": 3.3167807131532365,
+    "trades": 51
+  },
+  {
+    "episode": 9,
+    "symbol": "MU",
+    "total_reward": 258.6999999999997,
+    "net_worth": 16318.85862159729,
+    "total_return": 63.1885862159729,
+    "sharpe": 4.427311411890185,
+    "trades": 67
+  },
+  {
+    "episode": 10,
+    "symbol": "LRCX",
+    "total_reward": 357.9000000000009,
+    "net_worth": 13022.063221216202,
+    "total_return": 30.22063221216202,
+    "sharpe": 2.6030947630567907,
+    "trades": 73
+  },
+  {
+    "episode": 11,
+    "symbol": "AAPL",
+    "total_reward": 301.30000000000007,
+    "net_worth": 13930.015455245972,
+    "total_return": 39.300154552459716,
+    "sharpe": 2.471903877088297,
+    "trades": 96
+  },
+  {
+    "episode": 12,
+    "symbol": "MSFT",
+    "total_reward": 353.29999999999995,
+    "net_worth": 11659.168802261353,
+    "total_return": 16.591688022613525,
+    "sharpe": 1.8274557247544938,
+    "trades": 97
+  },
+  {
+    "episode": 13,
+    "symbol": "GOOGL",
+    "total_reward": 289.999999999999,
+    "net_worth": 13164.500707626343,
+    "total_return": 31.645007076263425,
+    "sharpe": 3.8126384074922277,
+    "trades": 74
+  },
+  {
+    "episode": 14,
+    "symbol": "META",
+    "total_reward": 250.09999999999908,
+    "net_worth": 13098.569562911987,
+    "total_return": 30.985695629119874,
+    "sharpe": 4.103690077412261,
+    "trades": 74
+  },
+  {
+    "episode": 15,
+    "symbol": "AMZN",
+    "total_reward": 328.7000000000007,
+    "net_worth": 15673.491458892822,
+    "total_return": 56.73491458892822,
+    "sharpe": 4.459606797307206,
+    "trades": 84
+  },
+  {
+    "episode": 16,
+    "symbol": "TSLA",
+    "total_reward": 295.69999999999936,
+    "net_worth": 29905.848949193954,
+    "total_return": 199.05848949193953,
+    "sharpe": 4.558158689473964,
+    "trades": 82
+  },
+  {
+    "episode": 17,
+    "symbol": "NFLX",
+    "total_reward": 359.5000000000024,
+    "net_worth": 15415.32505774498,
+    "total_return": 54.153250577449796,
+    "sharpe": 3.0397796730714948,
+    "trades": 89
+  },
+  {
+    "episode": 18,
+    "symbol": "PYPL",
+    "total_reward": 221.39999999999898,
+    "net_worth": 12401.108596801758,
+    "total_return": 24.01108596801758,
+    "sharpe": 3.216613299160232,
+    "trades": 56
+  },
+  {
+    "episode": 19,
+    "symbol": "DIS",
+    "total_reward": 298.6999999999999,
+    "net_worth": 11627.83996963501,
+    "total_return": 16.2783996963501,
+    "sharpe": 2.3189823401740304,
+    "trades": 70
+  },
+  {
+    "episode": 20,
+    "symbol": "CRM",
+    "total_reward": 66.79999999999995,
+    "net_worth": 11153.80324935913,
+    "total_return": 11.53803249359131,
+    "sharpe": 2.5037449554138975,
+    "trades": 93
+  },
+  {
+    "episode": 21,
+    "symbol": "ORCL",
+    "total_reward": 214.19999999999942,
+    "net_worth": 11205.966890335083,
+    "total_return": 12.05966890335083,
+    "sharpe": 2.3149849119445998,
+    "trades": 79
+  },
+  {
+    "episode": 22,
+    "symbol": "IBM",
+    "total_reward": 172.19999999999894,
+    "net_worth": 9375.845748901367,
+    "total_return": -6.241542510986328,
+    "sharpe": -1.2757292573530779,
+    "trades": 70
+  },
+  {
+    "episode": 23,
+    "symbol": "CSCO",
+    "total_reward": 315.9000000000011,
+    "net_worth": 12342.050637245178,
+    "total_return": 23.420506372451783,
+    "sharpe": 3.237191808405228,
+    "trades": 91
+  },
+  {
+    "episode": 24,
+    "symbol": "BABA",
+    "total_reward": 171.7999999999994,
+    "net_worth": 12777.475372314453,
+    "total_return": 27.774753723144528,
+    "sharpe": 4.088292435894343,
+    "trades": 55
+  },
+  {
+    "episode": 25,
+    "symbol": "ADBE",
+    "total_reward": 364.50000000000045,
+    "net_worth": 12438.780494689941,
+    "total_return": 24.387804946899415,
+    "sharpe": 2.9194470815340594,
+    "trades": 87
+  },
+  {
+    "episode": 26,
+    "symbol": "SHOP",
+    "total_reward": 246.89999999999947,
+    "net_worth": 16894.70849943161,
+    "total_return": 68.9470849943161,
+    "sharpe": 5.266610458904691,
+    "trades": 59
+  },
+  {
+    "episode": 27,
+    "symbol": "UBER",
+    "total_reward": 20.90000000000002,
+    "net_worth": 9783.089942932129,
+    "total_return": -2.169100570678711,
+    "sharpe": -2.3699805193210612,
+    "trades": 13
+  },
+  {
+    "episode": 28,
+    "symbol": "LYFT",
+    "total_reward": 34.30000000000006,
+    "net_worth": 10016.639850616455,
+    "total_return": 0.1663985061645508,
+    "sharpe": 1.1912794374140918,
+    "trades": 13
+  },
+  {
+    "episode": 29,
+    "symbol": "JPM",
+    "total_reward": 257.7999999999995,
+    "net_worth": 12225.540994644165,
+    "total_return": 22.255409946441652,
+    "sharpe": 2.101422492329074,
+    "trades": 94
+  },
+  {
+    "episode": 30,
+    "symbol": "GS",
+    "total_reward": 232.99999999999898,
+    "net_worth": 11391.43523406983,
+    "total_return": 13.914352340698297,
+    "sharpe": 1.4796107303998953,
+    "trades": 76
+  },
+  {
+    "episode": 31,
+    "symbol": "MS",
+    "total_reward": 259.7999999999991,
+    "net_worth": 12167.178518295288,
+    "total_return": 21.67178518295288,
+    "sharpe": 2.2916573621220238,
+    "trades": 94
+  },
+  {
+    "episode": 32,
+    "symbol": "BAC",
+    "total_reward": 240.2999999999988,
+    "net_worth": 11631.555764198303,
+    "total_return": 16.315557641983034,
+    "sharpe": 2.229936768437009,
+    "trades": 94
+  },
+  {
+    "episode": 33,
+    "symbol": "WFC",
+    "total_reward": 143.49999999999957,
+    "net_worth": 11786.96330833435,
+    "total_return": 17.869633083343505,
+    "sharpe": 2.411533642531172,
+    "trades": 81
+  },
+  {
+    "episode": 34,
+    "symbol": "V",
+    "total_reward": 305.00000000000114,
+    "net_worth": 11387.761501312256,
+    "total_return": 13.877615013122558,
+    "sharpe": 2.4128893529887327,
+    "trades": 101
+  },
+  {
+    "episode": 35,
+    "symbol": "MA",
+    "total_reward": 257.89999999999964,
+    "net_worth": 11487.840396881104,
+    "total_return": 14.878403968811035,
+    "sharpe": 2.4467515205924424,
+    "trades": 114
+  },
+  {
+    "episode": 36,
+    "symbol": "AXP",
+    "total_reward": 269.89999999999986,
+    "net_worth": 12148.063709259033,
+    "total_return": 21.48063709259033,
+    "sharpe": 3.154199798519953,
+    "trades": 77
+  },
+  {
+    "episode": 37,
+    "symbol": "C",
+    "total_reward": -259.0000000000004,
+    "net_worth": 9126.490400314331,
+    "total_return": -8.735095996856689,
+    "sharpe": -1.013374403154491,
+    "trades": 94
+  },
+  {
+    "episode": 38,
+    "symbol": "BLK",
+    "total_reward": 305.49999999999966,
+    "net_worth": 11136.322631835938,
+    "total_return": 11.363226318359375,
+    "sharpe": 1.4461809502466534,
+    "trades": 92
+  },
+  {
+    "episode": 39,
+    "symbol": "SPGI",
+    "total_reward": 361.20000000000175,
+    "net_worth": 13755.762104034424,
+    "total_return": 37.55762104034424,
+    "sharpe": 4.072974114710992,
+    "trades": 91
+  },
+  {
+    "episode": 40,
+    "symbol": "TROW",
+    "total_reward": 179.59999999999985,
+    "net_worth": 11335.33795928955,
+    "total_return": 13.353379592895509,
+    "sharpe": 1.8816594374441133,
+    "trades": 95
+  },
+  {
+    "episode": 41,
+    "symbol": "PFE",
+    "total_reward": 265.4999999999991,
+    "net_worth": 10415.017636299133,
+    "total_return": 4.150176362991333,
+    "sharpe": 0.8777540438851935,
+    "trades": 80
+  },
+  {
+    "episode": 42,
+    "symbol": "JNJ",
+    "total_reward": 318.3000000000003,
+    "net_worth": 12176.954895019531,
+    "total_return": 21.769548950195315,
+    "sharpe": 4.1238096839731195,
+    "trades": 91
+  },
+  {
+    "episode": 43,
+    "symbol": "MRK",
+    "total_reward": 239.59999999999872,
+    "net_worth": 11728.498849868774,
+    "total_return": 17.284988498687746,
+    "sharpe": 2.5307749665067507,
+    "trades": 98
+  },
+  {
+    "episode": 44,
+    "symbol": "LLY",
+    "total_reward": 327.7000000000005,
+    "net_worth": 12321.85283279419,
+    "total_return": 23.218528327941897,
+    "sharpe": 2.806535350563745,
+    "trades": 97
+  },
+  {
+    "episode": 45,
+    "symbol": "ABBV",
+    "total_reward": 238.99999999999952,
+    "net_worth": 12325.43447303772,
+    "total_return": 23.2543447303772,
+    "sharpe": 2.5978695946361023,
+    "trades": 88
+  },
+  {
+    "episode": 46,
+    "symbol": "UNH",
+    "total_reward": 327.4000000000003,
+    "net_worth": 12323.158126831055,
+    "total_return": 23.231581268310546,
+    "sharpe": 2.4614314172246474,
+    "trades": 92
+  },
+  {
+    "episode": 47,
+    "symbol": "TMO",
+    "total_reward": 321.70000000000016,
+    "net_worth": 12152.86030960083,
+    "total_return": 21.5286030960083,
+    "sharpe": 3.0587847495804237,
+    "trades": 120
+  },
+  {
+    "episode": 48,
+    "symbol": "ISRG",
+    "total_reward": 231.1999999999994,
+    "net_worth": 10577.588306427002,
+    "total_return": 5.77588306427002,
+    "sharpe": 0.8817636423058977,
+    "trades": 97
+  },
+  {
+    "episode": 49,
+    "symbol": "CVS",
+    "total_reward": 136.89999999999912,
+    "net_worth": 11105.88090133667,
+    "total_return": 11.0588090133667,
+    "sharpe": 2.188602234520881,
+    "trades": 80
+  },
+  {
+    "episode": 50,
+    "symbol": "BIIB",
+    "total_reward": -257.80000000000086,
+    "net_worth": 9023.160339355469,
+    "total_return": -9.768396606445313,
+    "sharpe": -1.6380207449781627,
+    "trades": 84
+  },
+  {
+    "episode": 51,
+    "symbol": "VRTX",
+    "total_reward": 81.89999999999989,
+    "net_worth": 12393.968536376953,
+    "total_return": 23.93968536376953,
+    "sharpe": 2.0006783153529075,
+    "trades": 80
+  },
+  {
+    "episode": 52,
+    "symbol": "WMT",
+    "total_reward": 239.89999999999955,
+    "net_worth": 10112.405221939087,
+    "total_return": 1.1240522193908693,
+    "sharpe": 0.34615663029518096,
+    "trades": 115
+  },
+  {
+    "episode": 53,
+    "symbol": "TGT",
+    "total_reward": 279.39999999999895,
+    "net_worth": 11827.125568389893,
+    "total_return": 18.271255683898925,
+    "sharpe": 2.6577829084699482,
+    "trades": 90
+  },
+  {
+    "episode": 54,
+    "symbol": "COST",
+    "total_reward": 372.5000000000007,
+    "net_worth": 11104.17544555664,
+    "total_return": 11.041754455566407,
+    "sharpe": 2.0720795434347803,
+    "trades": 90
+  },
+  {
+    "episode": 55,
+    "symbol": "MCD",
+    "total_reward": 278.3000000000005,
+    "net_worth": 11534.944271087646,
+    "total_return": 15.349442710876465,
+    "sharpe": 2.445210725039494,
+    "trades": 88
+  },
+  {
+    "episode": 56,
+    "symbol": "SBUX",
+    "total_reward": 191.89999999999947,
+    "net_worth": 11905.20803642273,
+    "total_return": 19.052080364227294,
+    "sharpe": 2.6388064443298345,
+    "trades": 121
+  },
+  {
+    "episode": 57,
+    "symbol": "NKE",
+    "total_reward": 319.6999999999992,
+    "net_worth": 11135.259244918823,
+    "total_return": 11.352592449188233,
+    "sharpe": 2.0724572107912143,
+    "trades": 85
+  },
+  {
+    "episode": 58,
+    "symbol": "HD",
+    "total_reward": 344.90000000000015,
+    "net_worth": 11782.127906799316,
+    "total_return": 17.821279067993164,
+    "sharpe": 1.6928142841464253,
+    "trades": 113
+  },
+  {
+    "episode": 59,
+    "symbol": "LOW",
+    "total_reward": 309.70000000000005,
+    "net_worth": 12439.470726013184,
+    "total_return": 24.394707260131838,
+    "sharpe": 1.985716992965423,
+    "trades": 99
+  },
+  {
+    "episode": 60,
+    "symbol": "TSCO",
+    "total_reward": 133.89999999999935,
+    "net_worth": 11808.319706916809,
+    "total_return": 18.08319706916809,
+    "sharpe": 1.678044895784919,
+    "trades": 92
+  },
+  {
+    "episode": 61,
+    "symbol": "BBY",
+    "total_reward": -744.4999999999985,
+    "net_worth": 9038.31803035736,
+    "total_return": -9.616819696426392,
+    "sharpe": -0.302055753244621,
+    "trades": 86
+  },
+  {
+    "episode": 62,
+    "symbol": "KO",
+    "total_reward": 215.199999999999,
+    "net_worth": 9939.806106567383,
+    "total_return": -0.6019389343261718,
+    "sharpe": -0.2770561881095595,
+    "trades": 101
+  },
+  {
+    "episode": 63,
+    "symbol": "PEP",
+    "total_reward": 309.2000000000001,
+    "net_worth": 11284.336936950684,
+    "total_return": 12.843369369506835,
+    "sharpe": 2.431000563805093,
+    "trades": 112
+  },
+  {
+    "episode": 64,
+    "symbol": "XOM",
+    "total_reward": 133.59999999999945,
+    "net_worth": 10221.994956970215,
+    "total_return": 2.2199495697021487,
+    "sharpe": 0.4918528952669076,
+    "trades": 87
+  },
+  {
+    "episode": 65,
+    "symbol": "CVX",
+    "total_reward": 154.79999999999956,
+    "net_worth": 11119.411834716797,
+    "total_return": 11.194118347167969,
+    "sharpe": 2.1660909796081973,
+    "trades": 92
+  },
+  {
+    "episode": 66,
+    "symbol": "SLB",
+    "total_reward": 122.29999999999914,
+    "net_worth": 10371.12141418457,
+    "total_return": 3.711214141845703,
+    "sharpe": -1.2032772567097254,
+    "trades": 71
+  },
+  {
+    "episode": 67,
+    "symbol": "HAL",
+    "total_reward": 168.69999999999902,
+    "net_worth": 12062.845673561096,
+    "total_return": 20.62845673561096,
+    "sharpe": 2.76681455820795,
+    "trades": 85
+  },
+  {
+    "episode": 68,
+    "symbol": "PSX",
+    "total_reward": 81.599999999999,
+    "net_worth": 9711.271183013916,
+    "total_return": -2.88728816986084,
+    "sharpe": 0.14656885052696794,
+    "trades": 94
+  },
+  {
+    "episode": 69,
+    "symbol": "VLO",
+    "total_reward": 56.99999999999904,
+    "net_worth": 11339.910367965698,
+    "total_return": 13.399103679656982,
+    "sharpe": 1.089841988979924,
+    "trades": 118
+  },
+  {
+    "episode": 70,
+    "symbol": "EOG",
+    "total_reward": 165.999999999999,
+    "net_worth": 11457.142539978027,
+    "total_return": 14.571425399780274,
+    "sharpe": 2.0940861692408617,
+    "trades": 102
+  },
+  {
+    "episode": 71,
+    "symbol": "OXY",
+    "total_reward": 165.3999999999999,
+    "net_worth": 11020.040218353271,
+    "total_return": 10.200402183532715,
+    "sharpe": 2.2243608354095867,
+    "trades": 80
+  },
+  {
+    "episode": 72,
+    "symbol": "MPC",
+    "total_reward": -341.49999999999966,
+    "net_worth": 10310.38833618164,
+    "total_return": 3.1038833618164063,
+    "sharpe": 0.735108975158116,
+    "trades": 113
+  },
+  {
+    "episode": 73,
+    "symbol": "COP",
+    "total_reward": 191.69999999999897,
+    "net_worth": 12148.615737915039,
+    "total_return": 21.48615737915039,
+    "sharpe": 1.9980541138115364,
+    "trades": 81
+  },
+  {
+    "episode": 74,
+    "symbol": "CAT",
+    "total_reward": 199.99999999999957,
+    "net_worth": 10427.964851379395,
+    "total_return": 4.279648513793945,
+    "sharpe": 0.18552254359111447,
+    "trades": 96
+  },
+  {
+    "episode": 75,
+    "symbol": "BA",
+    "total_reward": 252.29999999999882,
+    "net_worth": 14036.431133270264,
+    "total_return": 40.364311332702634,
+    "sharpe": 4.060621388152331,
+    "trades": 97
+  },
+  {
+    "episode": 76,
+    "symbol": "HON",
+    "total_reward": 249.19999999999857,
+    "net_worth": 14218.030799865723,
+    "total_return": 42.18030799865723,
+    "sharpe": 4.595735405182824,
+    "trades": 130
+  },
+  {
+    "episode": 77,
+    "symbol": "LMT",
+    "total_reward": 316.3000000000011,
+    "net_worth": 11434.54354095459,
+    "total_return": 14.345435409545898,
+    "sharpe": 1.9638143255356058,
+    "trades": 120
+  },
+  {
+    "episode": 78,
+    "symbol": "RTX",
+    "total_reward": 218.8999999999986,
+    "net_worth": 11664.53327178955,
+    "total_return": 16.64533271789551,
+    "sharpe": 2.6771244388232582,
+    "trades": 98
+  },
+  {
+    "episode": 79,
+    "symbol": "DE",
+    "total_reward": 271.79999999999984,
+    "net_worth": 13133.585395812988,
+    "total_return": 31.335853958129885,
+    "sharpe": 2.639262402069488,
+    "trades": 101
+  },
+  {
+    "episode": 80,
+    "symbol": "UNP",
+    "total_reward": 170.89999999999876,
+    "net_worth": 10486.217338562012,
+    "total_return": 4.8621733856201175,
+    "sharpe": 0.362270945686667,
+    "trades": 138
+  },
+  {
+    "episode": 81,
+    "symbol": "UPS",
+    "total_reward": 227.69999999999823,
+    "net_worth": 11422.396251678467,
+    "total_return": 14.223962516784669,
+    "sharpe": 1.4158262325060527,
+    "trades": 119
+  },
+  {
+    "episode": 82,
+    "symbol": "FDX",
+    "total_reward": 223.29999999999882,
+    "net_worth": 11285.126815795898,
+    "total_return": 12.851268157958984,
+    "sharpe": 1.5660712405815396,
+    "trades": 109
+  },
+  {
+    "episode": 83,
+    "symbol": "GE",
+    "total_reward": 53.09999999999979,
+    "net_worth": 9917.01933670044,
+    "total_return": -0.8298066329956055,
+    "sharpe": 0.5981121743615905,
+    "trades": 92
+  },
+  {
+    "episode": 84,
+    "symbol": "AMT",
+    "total_reward": 277.09999999999945,
+    "net_worth": 10893.826885223389,
+    "total_return": 8.938268852233886,
+    "sharpe": 1.1544026229442217,
+    "trades": 107
+  },
+  {
+    "episode": 85,
+    "symbol": "PLD",
+    "total_reward": 247.099999999999,
+    "net_worth": 12503.57695198059,
+    "total_return": 25.035769519805907,
+    "sharpe": 3.0787903132026684,
+    "trades": 107
+  },
+  {
+    "episode": 86,
+    "symbol": "CCI",
+    "total_reward": 247.79999999999868,
+    "net_worth": 11480.240409851074,
+    "total_return": 14.802404098510744,
+    "sharpe": 1.8782621206716346,
+    "trades": 124
+  },
+  {
+    "episode": 87,
+    "symbol": "SPG",
+    "total_reward": 220.9999999999992,
+    "net_worth": 10396.751274108887,
+    "total_return": 3.9675127410888673,
+    "sharpe": 0.2673374526521241,
+    "trades": 82
+  },
+  {
+    "episode": 88,
+    "symbol": "EQIX",
+    "total_reward": 232.89999999999898,
+    "net_worth": 11031.016593933105,
+    "total_return": 10.310165939331055,
+    "sharpe": 1.5867397175487619,
+    "trades": 122
+  },
+  {
+    "episode": 89,
+    "symbol": "PSA",
+    "total_reward": 302.89999999999844,
+    "net_worth": 11798.529777526855,
+    "total_return": 17.985297775268556,
+    "sharpe": 3.355204842552949,
+    "trades": 74
+  },
+  {
+    "episode": 90,
+    "symbol": "DLR",
+    "total_reward": 85.29999999999907,
+    "net_worth": 10097.714302062988,
+    "total_return": 0.9771430206298828,
+    "sharpe": -0.23962826859935685,
+    "trades": 117
+  },
+  {
+    "episode": 91,
+    "symbol": "NEE",
+    "total_reward": 298.99999999999983,
+    "net_worth": 11983.295722007751,
+    "total_return": 19.832957220077514,
+    "sharpe": 3.024652578882987,
+    "trades": 120
+  },
+  {
+    "episode": 92,
+    "symbol": "DUK",
+    "total_reward": 253.4999999999986,
+    "net_worth": 10122.075527191162,
+    "total_return": 1.220755271911621,
+    "sharpe": 0.7471040581656615,
+    "trades": 108
+  },
+  {
+    "episode": 93,
+    "symbol": "SO",
+    "total_reward": 88.89999999999935,
+    "net_worth": 9842.367803573608,
+    "total_return": -1.576321964263916,
+    "sharpe": -0.30294743698234866,
+    "trades": 95
+  },
+  {
+    "episode": 94,
+    "symbol": "EXC",
+    "total_reward": 191.49999999999915,
+    "net_worth": 11356.819408416748,
+    "total_return": 13.568194084167482,
+    "sharpe": 1.570668966405549,
+    "trades": 97
+  },
+  {
+    "episode": 95,
+    "symbol": "TMUS",
+    "total_reward": 207.6999999999992,
+    "net_worth": 11109.321015357971,
+    "total_return": 11.093210153579712,
+    "sharpe": 1.703724230534446,
+    "trades": 105
+  },
+  {
+    "episode": 96,
+    "symbol": "T",
+    "total_reward": 195.99999999999895,
+    "net_worth": 10021.820295333862,
+    "total_return": 0.21820295333862305,
+    "sharpe": -0.44160247674297876,
+    "trades": 65
+  },
+  {
+    "episode": 97,
+    "symbol": "VZ",
+    "total_reward": 190.19999999999885,
+    "net_worth": 10423.120637893677,
+    "total_return": 4.2312063789367675,
+    "sharpe": 0.8166033161277682,
+    "trades": 76
+  },
+  {
+    "episode": 98,
+    "symbol": "CMCSA",
+    "total_reward": 193.199999999999,
+    "net_worth": 10957.250605583191,
+    "total_return": 9.572506055831909,
+    "sharpe": 1.6675171987990105,
+    "trades": 103
+  },
+  {
+    "episode": 99,
+    "symbol": "CHTR",
+    "total_reward": 352.3000000000008,
+    "net_worth": 13625.829483032227,
+    "total_return": 36.258294830322264,
+    "sharpe": 3.8060044838245566,
+    "trades": 76
+  },
+  {
+    "episode": 100,
+    "symbol": "ADI",
+    "total_reward": 185.69999999999948,
+    "net_worth": 11098.703247070312,
+    "total_return": 10.987032470703124,
+    "sharpe": 2.7739320194903287,
+    "trades": 86
+  }
+]

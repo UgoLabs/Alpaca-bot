@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # 🤖 Day Trader Bot (Paper Account 2)
+  daytrader:
+    build: .
+    container_name: alpaca_daytrader
+    command: python src/bot_daytrader_pure.py
+    restart: unless-stopped
+    volumes:
+      - ./models:/app/models          # Save models/logs to host
+      - ./logs:/app/logs
+      - ./my_portfolio.txt:/app/my_portfolio.txt # Allow editing portfolio on host
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # 🤖 Swing Trader Bot (Paper Account 1)
+  swingtrader:
+    build: .
+    container_name: alpaca_swingtrader
+    command: python src/bot_standalone.py
+    restart: unless-stopped
+    volumes:
+      - ./models:/app/models          # Save learned model to host!
+      - ./logs:/app/logs
+      - ./my_portfolio.txt:/app/my_portfolio.txt
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1

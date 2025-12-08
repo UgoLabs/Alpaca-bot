@@ -1,0 +1,33 @@
+# Environment variables
+.env
+
+# Python virtual environment
+tf-gpu-env/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Log files
+*.log
+
+# Model files (these can be large)
+models/*.h5
+models/*.weights
+models/*.model
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db 
