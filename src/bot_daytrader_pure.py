@@ -143,12 +143,32 @@ class PureDayTrader:
         
         while True:
             # 1. Market Open Check & EOD Liquidation
+            # 1. Market Open Check & EOD Liquidation
             try:
                 clock = self.api.get_clock()
                 if not clock.is_open:
-                    print("💤 Market closed")
-                    time.sleep(300)
-                    continue
+                    now = datetime.now(clock.timestamp.tzinfo)
+                    next_open = clock.next_open
+                    time_to_open = (next_open - now).total_seconds()
+                    
+                    if time_to_open > 300:
+                        sleep_time = time_to_open - 300  # Wake up 5 mins early
+                        wake_time = now.timestamp() + sleep_time
+                        wake_dt = datetime.fromtimestamp(wake_time)
+                        
+                        print(f"💤 Market closed. Sleeping until {wake_dt.strftime('%H:%M:%S')} (5 min before open)")
+                        time.sleep(sleep_time)
+                        
+                        # Refresh clock after waking up
+                        clock = self.api.get_clock()
+                        if not clock.is_open:
+                            print("⏳ Waking up... Waiting for market open...")
+                            time.sleep(60)
+                            continue
+                    else:
+                         print("💤 Market closed")
+                         time.sleep(60)
+                         continue
                 
                 # EOD Liquidation: Close all positions 15 min before close
                 import pytz

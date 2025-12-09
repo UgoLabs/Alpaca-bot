@@ -1,0 +1,18 @@
+{
+  "initial_balance": 10000,
+  "final_value": 10483.794799804688,
+  "total_return_pct": 4.837947998046875,
+  "buy_hold_return_pct": 27.05883522809454,
+  "alpha": -22.220887230047666,
+  "total_trades": 22,
+  "winning_trades": 13,
+  "losing_trades": 9,
+  "win_rate_pct": 59.09090909090909,
+  "avg_win_pct": 2.182331124439625,
+  "avg_loss_pct": -1.0068408807432938,
+  "profit_factor": 3.343239703073012,
+  "sharpe_ratio": 0.21778387190204035,
+  "sortino_ratio": 0.2897615452615009,
+  "max_drawdown_pct": -1.6577111771704796,
+  "symbol": "SPY"
+}

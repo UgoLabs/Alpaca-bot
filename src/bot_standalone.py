@@ -543,11 +543,21 @@ class PaperTrader:
                 clock = self.api.get_clock()
                 if clock.is_open:
                     self.run_once()
+                    print(f"⏳ Sleeping {interval_minutes} minutes...")
+                    time.sleep(interval_minutes * 60)
                 else:
-                    print(f"💤 Market closed. Next open: {clock.next_open.strftime('%Y-%m-%d %H:%M')}")
-                
-                print(f"⏳ Sleeping {interval_minutes} minutes...")
-                time.sleep(interval_minutes * 60)
+                    now = datetime.now(clock.timestamp.tzinfo)
+                    next_open = clock.next_open
+                    time_to_open = (next_open - now).total_seconds()
+                    
+                    if time_to_open > 300:
+                        sleep_time = time_to_open - 300  # Wake up 5 mins early
+                        wake_dt = datetime.fromtimestamp(now.timestamp() + sleep_time)
+                        print(f"💤 Market closed. Sleeping until {wake_dt.strftime('%H:%M:%S')} (5 min before open)")
+                        time.sleep(sleep_time)
+                    else:
+                        print("⏳ Waiting for market open...")
+                        time.sleep(60)
             except KeyboardInterrupt:
                 print("\n🛑 Stopping bot...")
                 break

@@ -18,6 +18,9 @@ __pycache__/
 models/*.h5
 models/*.weights
 models/*.model
+models/*.pth
+models/*.pt
+models/*.pkl
 
 # IDE specific files
 .vscode/
