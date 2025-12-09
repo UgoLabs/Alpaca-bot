@@ -32,14 +32,15 @@ class CryptoScalper:
     TRAIL_TRIGGER = 0.002     # Trail starts at +0.2%
     TRAIL_DISTANCE = 0.001    # Trail distance 0.1%
     
-    MAX_POSITIONS = 5
-    POSITION_SIZE_PCT = 0.15
+    MAX_POSITIONS = 20        # Virtually unlimited (covers all 15 symbols)
+    POSITION_SIZE_PCT = 0.065 # 6.5% size allows holding all ~15 symbols (15 * 6.5% ~= 97.5%)
     SCAN_INTERVAL = 10        # 10s Loop
     
     def __init__(self):
         self.api = tradeapi.REST(self.API_KEY, self.API_SECRET, self.BASE_URL, api_version='v2')
         self.entry_prices = {}  # Track entry for trailing stops
         self.peak_prices = {}   # Track peak for trailing
+        self.entry_times = {}   # Track entry time for stale exit
         
         print("="*60)
         print("⚡ CRYPTO SCALPING BOT")
@@ -188,6 +189,7 @@ class CryptoScalper:
         if symbol not in self.entry_prices:
             self.entry_prices[symbol] = entry
             self.peak_prices[symbol] = current_price
+            self.entry_times[symbol] = time.time()
         
         # Update peak
         if current_price > self.peak_prices[symbol]:
@@ -195,6 +197,9 @@ class CryptoScalper:
         
         peak = self.peak_prices[symbol]
         drawdown_from_peak = (current_price - peak) / peak
+        
+        # Calculate duration
+        duration_mins = (time.time() - self.entry_times.get(symbol, time.time())) / 60
         
         # Exit conditions
         action = None
@@ -214,6 +219,11 @@ class CryptoScalper:
         elif pnl_pct >= self.TRAIL_TRIGGER and drawdown_from_peak <= -self.TRAIL_DISTANCE:
             action = 'TRAIL'
             reason = f'Trail Stop {pnl_pct*100:.2f}% (peak: {((peak-entry)/entry)*100:.2f}%)'
+            
+        # 4. Stale Exit (Time limit) - if held > 20 mins and slightly green, just take it.
+        elif duration_mins > 20 and pnl_pct > 0.001:
+            action = 'STALE'
+            reason = f'Stale Exit (+{pnl_pct*100:.2f}%)'
         
         return action, reason, pnl_pct
     
