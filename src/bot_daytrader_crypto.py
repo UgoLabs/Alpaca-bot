@@ -28,7 +28,7 @@ class CryptoScalper:
     
     # ========== SCALPING PARAMETERS ==========
     PROFIT_TARGET = 0.003     # 0.3% Take Profit (Very fast execution)
-    STOP_LOSS = -0.003        # Stop Loss -0.3%
+    STOP_LOSS = -0.002        # Stop Loss -0.2% (Tighter!)
     TRAIL_TRIGGER = 0.002     # Trail starts at +0.2%
     TRAIL_DISTANCE = 0.001    # Trail distance 0.1%
     
