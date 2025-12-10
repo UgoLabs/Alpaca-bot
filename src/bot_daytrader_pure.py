@@ -316,6 +316,21 @@ class PureDayTrader:
                                     print(f"   🛡️ STOP set @ ${stop_price:.2f}")
                                 except Exception as e:
                                     print(f"   ⚠️ Stop order failed: {str(e)[:30]}")
+                                
+                                # Submit server-side take-profit order
+                                take_profit_price = round(current_price * (1 + PROFIT_TARGET), 2)
+                                try:
+                                    self.api.submit_order(
+                                        symbol=symbol,
+                                        qty=qty,
+                                        side='sell',
+                                        type='limit',
+                                        limit_price=take_profit_price,
+                                        time_in_force='day'
+                                    )
+                                    print(f"   🎯 PROFIT set @ ${take_profit_price:.2f}")
+                                except Exception as e:
+                                    print(f"   ⚠️ Profit order failed: {str(e)[:30]}")
                             except Exception as e:
                                 print(f"   ❌ ORDER FAILED: {e}")
                 

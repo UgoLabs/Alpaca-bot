@@ -351,6 +351,21 @@ class MoneyScraperBot:
                                 print(f"   🛡️ STOP set for {symbol} @ ${stop_price:.2f}")
                             except Exception as e:
                                 print(f"   ⚠️ Stop order failed for {symbol}: {str(e)[:30]}")
+                            
+                            # Submit TAKE-PROFIT order (server-side limit sell)
+                            take_profit_price = round(price + (PROFIT_TARGET_DOLLARS / qty), 2)
+                            try:
+                                self.api.submit_order(
+                                    symbol=symbol,
+                                    qty=qty,
+                                    side='sell',
+                                    type='limit',
+                                    limit_price=take_profit_price,
+                                    time_in_force='day'
+                                )
+                                print(f"   🎯 PROFIT set for {symbol} @ ${take_profit_price:.2f}")
+                            except Exception as e:
+                                print(f"   ⚠️ Profit order failed for {symbol}: {str(e)[:30]}")
                                 
                         except Exception as e:
                             print(f"   ❌ {symbol}: {str(e)[:30]}")
