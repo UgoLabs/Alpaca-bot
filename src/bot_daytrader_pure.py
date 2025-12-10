@@ -20,6 +20,7 @@ PROFIT_TARGET = 0.005  # 0.5% (Quick scalps)
 STOP_LOSS = 0.003      # 0.3% (Tight control)
 MAX_POSITIONS = 10
 COOLDOWN_SECONDS = 300  # 5 min cooldown after exit
+SCAN_INTERVAL = 5       # Scan every 5 seconds
 
 class PureDayTrader:
     def __init__(self):
@@ -300,6 +301,21 @@ class PureDayTrader:
                             try:
                                 self.api.submit_order(symbol=symbol, qty=qty, side='buy', type='market', time_in_force='day')
                                 print(f"   🚀 EXECUTED BUY: {qty} {symbol} @ ${current_price:.2f}")
+                                
+                                # Submit server-side stop-loss order
+                                stop_price = round(current_price * (1 - STOP_LOSS), 2)
+                                try:
+                                    self.api.submit_order(
+                                        symbol=symbol,
+                                        qty=qty,
+                                        side='sell',
+                                        type='stop',
+                                        stop_price=stop_price,
+                                        time_in_force='day'
+                                    )
+                                    print(f"   🛡️ STOP set @ ${stop_price:.2f}")
+                                except Exception as e:
+                                    print(f"   ⚠️ Stop order failed: {str(e)[:30]}")
                             except Exception as e:
                                 print(f"   ❌ ORDER FAILED: {e}")
                 
@@ -307,7 +323,7 @@ class PureDayTrader:
                     print(f"⚠️ Error {symbol}: {e}")
             
             print(f"⏰ {datetime.now().strftime('%H:%M:%S')} - Scan complete")
-            time.sleep(30)  # Keep fast scanning
+            time.sleep(SCAN_INTERVAL)  # Fast scanning with server-side stops
 
 if __name__ == "__main__":
     bot = PureDayTrader()

@@ -25,7 +25,7 @@ BASE_URL = "https://paper-api.alpaca.markets"
 PROFIT_TARGET_DOLLARS = 5.0   # Exit at +$5 profit
 STOP_LOSS_DOLLARS = 2.0       # Exit at -$2 loss
 MAX_POSITIONS = 10            # Max 10 positions - pick best AI signals
-SCAN_INTERVAL_SECONDS = 10    # Scan every 10 seconds for faster stops
+SCAN_INTERVAL_SECONDS = 5     # Scan every 5 seconds for faster stops
 
 
 class MoneyScraperBot:
