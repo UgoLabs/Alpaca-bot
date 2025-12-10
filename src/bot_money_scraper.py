@@ -25,7 +25,7 @@ BASE_URL = "https://paper-api.alpaca.markets"
 PROFIT_TARGET_DOLLARS = 5.0   # Exit at +$5 profit
 STOP_LOSS_DOLLARS = 2.0       # Exit at -$2 loss
 MAX_POSITIONS = 10            # Max 10 positions - pick best AI signals
-SCAN_INTERVAL_SECONDS = 30    # Scan every 30 seconds
+SCAN_INTERVAL_SECONDS = 10    # Scan every 10 seconds for faster stops
 
 
 class MoneyScraperBot:
@@ -327,6 +327,7 @@ class MoneyScraperBot:
                     
                     if qty > 0:
                         try:
+                            # Submit BUY order
                             self.api.submit_order(
                                 symbol=symbol,
                                 qty=qty,
@@ -335,6 +336,22 @@ class MoneyScraperBot:
                                 time_in_force='day'
                             )
                             print(f"   🟢 BUY {symbol}: {qty} @ ${price:.2f} (conf: {confidence:.3f})")
+                            
+                            # Submit STOP-LOSS order immediately (server-side protection)
+                            stop_price = round(price - (STOP_LOSS_DOLLARS / qty), 2)
+                            try:
+                                self.api.submit_order(
+                                    symbol=symbol,
+                                    qty=qty,
+                                    side='sell',
+                                    type='stop',
+                                    stop_price=stop_price,
+                                    time_in_force='day'
+                                )
+                                print(f"   🛡️ STOP set for {symbol} @ ${stop_price:.2f}")
+                            except Exception as e:
+                                print(f"   ⚠️ Stop order failed for {symbol}: {str(e)[:30]}")
+                                
                         except Exception as e:
                             print(f"   ❌ {symbol}: {str(e)[:30]}")
         
