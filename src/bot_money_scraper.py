@@ -12,6 +12,9 @@ import alpaca_trade_api as tradeapi
 from datetime import datetime, timedelta
 from swing_model import DuelingDQN
 from utils import add_technical_indicators, normalize_state
+import torch
+import pickle
+from collections import deque
 
 # New Paper Account Credentials
 API_KEY = "PKBE4KSRXPQCWYQGRJSS5TAGNT"
@@ -33,10 +36,27 @@ class MoneyScraperBot:
         state_size = 231
         self.agent = DuelingDQN(state_size, 3, use_noisy=True)
         self.agent.load(model_path)
-        self.agent.model.eval()  # Inference mode
+        self.agent.model.train()  # Training mode for online learning
+        self.model_path = model_path
         
         # Load stock symbols from portfolio
         self.symbols = self.load_portfolio()
+        
+        # Online Learning Components
+        self.replay_buffer = deque(maxlen=10000)  # Store recent experiences
+        self.position_states = {}  # Track entry states for open positions
+        self.optimizer = torch.optim.Adam(self.agent.model.parameters(), lr=0.0001)
+        self.scan_count = 0
+        
+        # Load existing replay buffer if exists
+        buffer_path = 'models/money_scraper_buffer.pkl'
+        if os.path.exists(buffer_path):
+            try:
+                with open(buffer_path, 'rb') as f:
+                    self.replay_buffer = pickle.load(f)
+                print(f"📚 Loaded {len(self.replay_buffer)} experiences from buffer")
+            except:
+                pass
         
         print(f"\n{'='*60}")
         print(f"💰 AI MONEY SCRAPER BOT")
@@ -45,6 +65,7 @@ class MoneyScraperBot:
         print(f"📋 Portfolio: {len(self.symbols)} stocks")
         print(f"🎯 Profit: +${PROFIT_TARGET_DOLLARS} | Stop: -${STOP_LOSS_DOLLARS}")
         print(f"🔢 Max Positions: {MAX_POSITIONS}")
+        print(f"🧠 Online Learning: ENABLED")
         print(f"{'='*60}\n")
     
     def load_portfolio(self):
@@ -150,6 +171,50 @@ class MoneyScraperBot:
             print(f"   ⚠️ AI action error for {symbol}: {str(e)[:50]}")
             return 0, 0.0
     
+    def store_experience(self, symbol, state, action, next_state, reward):
+        \"\"\"Store trading experience for online learning\"\"\"
+        self.replay_buffer.append((state, action, reward, next_state, False))
+        
+        # Save buffer periodically
+        if len(self.replay_buffer) % 100 == 0:
+            try:
+                with open('models/money_scraper_buffer.pkl', 'wb') as f:
+                    pickle.dump(self.replay_buffer, f)
+            except:
+                pass
+    
+    def train_on_experiences(self, batch_size=64):
+        \"\"\"Train the model on collected live experiences\"\"\"
+        if len(self.replay_buffer) < batch_size:
+            return 0.0
+        
+        # Sample random batch
+        indices = np.random.choice(len(self.replay_buffer), batch_size, replace=False)
+        batch = [self.replay_buffer[i] for i in indices]
+        
+        states = torch.FloatTensor([exp[0] for exp in batch])
+        actions = torch.LongTensor([exp[1] for exp in batch])
+        rewards = torch.FloatTensor([exp[2] for exp in batch])
+        next_states = torch.FloatTensor([exp[3] for exp in batch])
+        dones = torch.FloatTensor([exp[4] for exp in batch])
+        
+        # Compute Q values
+        current_q = self.agent.model(states).gather(1, actions.unsqueeze(1))
+        
+        # Compute target Q values
+        with torch.no_grad():
+            next_q = self.agent.model(next_states).max(1)[0]
+            target_q = rewards + (1 - dones) * 0.99 * next_q
+        
+        # Compute loss and update
+        loss = torch.nn.functional.mse_loss(current_q.squeeze(), target_q)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+    
     def check_exits(self):
         """Check all positions for profit/loss targets"""
         try:
@@ -174,11 +239,19 @@ class MoneyScraperBot:
                     if total_pnl >= PROFIT_TARGET_DOLLARS:
                         self.api.close_position(symbol)
                         print(f"   ✅ {symbol:6s} PROFIT: ${total_pnl:+.2f} ({qty:.0f} shares)")
+                        # Store experience
+                        if symbol in self.position_states:
+                            self.store_experience(symbol, self.position_states[symbol]['state'], 1, self.position_states[symbol]['state'], total_pnl)
+                            del self.position_states[symbol]
                     
                     # Check stop loss
                     elif total_pnl <= -STOP_LOSS_DOLLARS:
                         self.api.close_position(symbol)
                         print(f"   🛑 {symbol:6s} STOP: ${total_pnl:+.2f} ({qty:.0f} shares)")
+                        # Store experience
+                        if symbol in self.position_states:
+                            self.store_experience(symbol, self.position_states[symbol]['state'], 1, self.position_states[symbol]['state'], total_pnl)
+                            del self.position_states[symbol]
                     
                     else:
                         print(f"   💎 {symbol:6s} ${total_pnl:+.2f} ({current_price:.2f})")
