@@ -172,7 +172,7 @@ class MoneyScraperBot:
             return 0, 0.0
     
     def store_experience(self, symbol, state, action, next_state, reward):
-        \"\"\"Store trading experience for online learning\"\"\"
+        """Store trading experience for online learning"""
         self.replay_buffer.append((state, action, reward, next_state, False))
         
         # Save buffer periodically
@@ -184,7 +184,7 @@ class MoneyScraperBot:
                 pass
     
     def train_on_experiences(self, batch_size=64):
-        \"\"\"Train the model on collected live experiences\"\"\"
+        """Train the model on collected live experiences"""
         if len(self.replay_buffer) < batch_size:
             return 0.0
         

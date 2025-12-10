@@ -24,6 +24,8 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # Load environment variables
 load_dotenv()
 
+MAX_POSITIONS = 20  # Limit max positions to rank best opportunities
+
 # =============================================================================
 # TECHNICAL INDICATORS (Pure Pandas/Numpy)
 # =============================================================================
@@ -229,6 +231,16 @@ class PaperTrader:
         self.optimizer = torch.optim.Adam(self.agent.model.parameters(), lr=0.0001)
         self.training_log = []
         
+        # Risk Management Tracking (matches training environment)
+        self.position_tracking = {}  # {symbol: {entry_price, entry_time, entry_atr, peak_price}}
+        
+        # Risk parameters (must match swing_environment.py)
+        self.stop_loss_atr_multiplier = 2.5      # Hard stop at 2.5x ATR
+        self.trailing_stop_atr_multiplier = 3.0  # Trail at 3x ATR
+        self.take_profit_atr_multiplier = 4.0    # Take profit at 4x ATR
+        self.rsi_extreme_overbought = 80         # Exit if RSI > 80
+        self.max_hold_days = 20                  # Force exit if losing after 20 days
+        
         # Load existing replay buffer if exists
         buffer_path = 'models/live_replay_buffer.pkl'
         if os.path.exists(buffer_path):
@@ -401,6 +413,66 @@ class PaperTrader:
         
         return action
 
+    def check_risk_stops(self, symbol, df, position):
+        """
+        Check if position should be closed due to risk management rules.
+        Returns: (should_close, reason)
+        """
+        if symbol not in self.position_tracking:
+            # Initialize tracking for existing position
+            current_price = float(df['Close'].iloc[-1])
+            self.position_tracking[symbol] = {
+                'entry_price': float(position.avg_entry_price),
+                'entry_time': datetime.now(),  # Approximate
+                'entry_atr': df['atr'].iloc[-1] if 'atr' in df.columns else current_price * 0.02,
+                'peak_price': current_price
+            }
+            return False, None
+        
+        tracking = self.position_tracking[symbol]
+        current_price = float(df['Close'].iloc[-1])
+        entry_price = tracking['entry_price']
+        entry_atr = tracking['entry_atr']
+        
+        # Update peak price
+        if current_price > tracking['peak_price']:
+            tracking['peak_price'] = current_price
+        
+        # 1. Hard Stop Loss (2.5x ATR below entry)
+        hard_stop = entry_price - (entry_atr * self.stop_loss_atr_multiplier)
+        if current_price < hard_stop:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+            return True, f"HARD_STOP ({pnl_pct:+.2f}%)"
+        
+        # 2. Take Profit (4x ATR above entry, or 6x if ADX > 30)
+        adx = df['adx'].iloc[-1] if 'adx' in df.columns else 20
+        multiplier = 6.0 if adx > 30 else self.take_profit_atr_multiplier
+        take_profit = entry_price + (entry_atr * multiplier)
+        if current_price >= take_profit:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+            return True, f"TAKE_PROFIT ({pnl_pct:+.2f}%)"
+        
+        # 3. RSI Extreme (RSI > 80 and in profit)
+        rsi = df['rsi'].iloc[-1] if 'rsi' in df.columns else 50
+        if rsi > self.rsi_extreme_overbought and current_price > entry_price:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+            return True, f"RSI_EXTREME ({pnl_pct:+.2f}%)"
+        
+        # 4. Trailing Stop (3x ATR below peak, only if in profit)
+        if current_price > entry_price:
+            trailing_stop = tracking['peak_price'] - (entry_atr * self.trailing_stop_atr_multiplier)
+            if current_price < trailing_stop:
+                pnl_pct = (current_price - entry_price) / entry_price * 100
+                return True, f"TRAILING_STOP ({pnl_pct:+.2f}%)"
+        
+        # 5. Time Stop (losing after 20 days)
+        days_held = (datetime.now() - tracking['entry_time']).days
+        if days_held > self.max_hold_days and current_price < entry_price:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+            return True, f"TIME_STOP ({pnl_pct:+.2f}%)"
+        
+        return False, None
+
     def run_once(self):
         print(f"\n{'='*60}")
         print(f"🔄 Scanning {len(self.symbols)} symbols...")
@@ -421,15 +493,16 @@ class PaperTrader:
             
         print(f"   ℹ️  Cached {len(alpaca_positions)} open positions")
         
+        potential_buys = []  # Store (symbol, price, confidence, state, qty)
+        
         for symbol in self.symbols:
             try:
                 # Get data from batch
                 df = all_data.get(symbol)
                 if df is None or len(df) < 250:
-                    # print(f"{symbol:6s} → SKIP (no data)") # Too spammy
                     continue
                 
-                # Calculate indicators and get action
+                # Calculate indicators
                 df = add_technical_indicators(df)
                 current_step = len(df) - 1
                 market_state = normalize_state(df, current_step)
@@ -443,6 +516,22 @@ class PaperTrader:
                     p = alpaca_positions[symbol]
                     market_value = float(p.market_value)
                     has_position = float(p.qty) > 0
+                    
+                    # CHECK RISK STOPS FIRST (overrides AI decision)
+                    if has_position:
+                        should_close, stop_reason = self.check_risk_stops(symbol, df, p)
+                        if should_close:
+                            try:
+                                self.api.close_position(symbol)
+                                print(f"{symbol:6s} → 🛑 {stop_reason}")
+                                # Clean up tracking
+                                if symbol in self.position_tracking:
+                                    del self.position_tracking[symbol]
+                                if symbol in self.position_states:
+                                    del self.position_states[symbol]
+                                continue  # Skip AI decision for this symbol
+                            except Exception as e:
+                                print(f"{symbol:6s} → ❌ STOP FAILED: {str(e)[:30]}")
                 
                 portfolio_state = np.array([
                     account['cash'] / account['equity'],
@@ -453,41 +542,19 @@ class PaperTrader:
                 ])
                 
                 state = np.concatenate((market_state, portfolio_state))
-                action = self.agent.act(state, epsilon=0.0)
+                
+                # Get Action and Confidence from Model
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    q_values = self.agent.model(state_tensor)
+                    action = q_values.argmax(1).item()
+                    confidence = q_values[0][action].item()
+                
                 action_name = ['HOLD', 'BUY', 'SELL'][action]
                 
-                # Execute Action
-                if action == 1 and not has_position:  # BUY
+                # Execute Sells Immediately
+                if action == 2 and has_position:  # SELL
                     try:
-                        current_price = float(df['Close'].iloc[-1])
-                        
-                        # Calculate position size (5% of equity per trade)
-                        allocation = account['equity'] * 0.05
-                        qty = int(allocation / current_price)
-                        
-                        if qty > 0:
-                            self.api.submit_order(
-                                symbol=symbol,
-                                qty=qty,
-                                side='buy',
-                                type='market',
-                                time_in_force='day'
-                            )
-                            # Store entry state for learning
-                            self.position_states[symbol] = {
-                                'state': state,
-                                'entry_price': current_price,
-                                'entry_time': datetime.now()
-                            }
-                            print(f"{symbol:6s} → 🟢 BUY {qty} @ ${current_price:.2f}")
-                        else:
-                            print(f"{symbol:6s} → HOLD (qty 0)")
-                    except Exception as e:
-                        print(f"{symbol:6s} → ❌ BUY FAILED: {str(e)[:30]}")
-                
-                elif action == 2 and has_position:  # SELL
-                    try:
-                        # Get position for P/L calculation
                         p = alpaca_positions[symbol]
                         entry_price = float(p.avg_entry_price)
                         current_price = float(df['Close'].iloc[-1])
@@ -495,25 +562,81 @@ class PaperTrader:
                         
                         self.api.close_position(symbol)
                         
-                        # Store experience if we have entry state
                         if symbol in self.position_states:
                             entry_state = self.position_states[symbol]['state']
-                            # Reward based on P/L percentage
-                            reward = pnl_pct * 100  # Scale up reward
-                            self.store_experience(symbol, entry_state, 1, state, reward)  # action=1 was BUY
+                            reward = pnl_pct * 100
+                            self.store_experience(symbol, entry_state, 1, state, reward)
                             del self.position_states[symbol]
                             print(f"{symbol:6s} → 🔴 SOLD (P/L: {pnl_pct*100:+.2f}%) [Learned ✓]")
                         else:
                             print(f"{symbol:6s} → 🔴 SOLD (P/L: {pnl_pct*100:+.2f}%)")
-                            
                     except Exception as e:
                         print(f"{symbol:6s} → ❌ SELL FAILED: {str(e)[:30]}")
-                
+
+                # Collect Buys for Ranking
+                elif action == 1 and not has_position:  # BUY
+                    current_price = float(df['Close'].iloc[-1])
+                    allocation = account['equity'] * 0.05
+                    qty = int(allocation / current_price)
+                    if qty > 0:
+                        potential_buys.append({
+                            'symbol': symbol,
+                            'price': current_price,
+                            'confidence': confidence,
+                            'state': state,
+                            'qty': qty,
+                            'atr': df['atr'].iloc[-1] if 'atr' in df.columns else current_price * 0.02
+                        })
+                    else:
+                        print(f"{symbol:6s} → HOLD (qty 0)")
+
                 else:
-                    print(f"{symbol:6s} → {action_name}")
+                    print(f"{symbol:6s} → {action_name} (conf: {confidence:.2f})")
                     
             except Exception as e:
                 print(f"{symbol:6s} → ERROR: {str(e)[:30]}")
+
+        # Execute Top Ranked Buys
+        if potential_buys:
+            # Sort by confidence
+            potential_buys.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            # Check slots
+            current_positions = len(self.api.list_positions())
+            slots_available = MAX_POSITIONS - current_positions
+            
+            if slots_available <= 0:
+                print(f"\n⚠️ Max positions ({MAX_POSITIONS}) reached. Skipping buys.")
+            else:
+                top_picks = potential_buys[:slots_available]
+                print(f"\n🎯 Processing top {len(top_picks)} buys from {len(potential_buys)} candidates:")
+                
+                for pick in top_picks:
+                    symbol = pick['symbol']
+                    try:
+                        self.api.submit_order(
+                            symbol=symbol,
+                            qty=pick['qty'],
+                            side='buy',
+                            type='market',
+                            time_in_force='day'
+                        )
+                        
+                        # Track state/risk
+                        self.position_states[symbol] = {
+                            'state': pick['state'],
+                            'entry_price': pick['price'],
+                            'entry_time': datetime.now()
+                        }
+                        self.position_tracking[symbol] = {
+                            'entry_price': pick['price'],
+                            'entry_time': datetime.now(),
+                            'entry_atr': pick['atr'],
+                            'peak_price': pick['price']
+                        }
+                        print(f"{symbol:6s} → 🟢 BUY {pick['qty']} @ ${pick['price']:.2f} (conf: {pick['confidence']:.3f})")
+                    except Exception as e:
+                        print(f"{symbol:6s} → ❌ BUY FAILED: {str(e)[:30]}")
         
         # Online Learning: Train on experiences 
         if len(self.replay_buffer) >= 64:
@@ -538,26 +661,54 @@ class PaperTrader:
 
     def run_loop(self, interval_minutes=15):
         print(f"🚀 Starting continuous trading (interval: {interval_minutes}min)")
+        import pytz
+        eastern = pytz.timezone('US/Eastern')
+        
         while True:
             try:
-                clock = self.api.get_clock()
-                if clock.is_open:
-                    self.run_once()
-                    print(f"⏳ Sleeping {interval_minutes} minutes...")
-                    time.sleep(interval_minutes * 60)
-                else:
-                    now = datetime.now(clock.timestamp.tzinfo)
-                    next_open = clock.next_open
-                    time_to_open = (next_open - now).total_seconds()
-                    
-                    if time_to_open > 300:
-                        sleep_time = time_to_open - 300  # Wake up 5 mins early
-                        wake_dt = datetime.fromtimestamp(now.timestamp() + sleep_time)
-                        print(f"💤 Market closed. Sleeping until {wake_dt.strftime('%H:%M:%S')} (5 min before open)")
-                        time.sleep(sleep_time)
+                now_et = datetime.now(eastern)
+                today_str = now_et.strftime('%Y-%m-%d')
+                
+                # Default timings (fallback)
+                market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+                
+                try:
+                    # Get correct schedule (Handles Holidays/Early Closes)
+                    schedules = self.api.get_calendar(start=today_str, end=today_str)
+                    if not schedules:
+                        print("💤 Market Closed (Holiday) - Sleeping 1 hour")
+                        time.sleep(3600)
+                        continue
+                        
+                    s = schedules[0]
+                    # Alpaca returns datetime objects or time objects
+                    if hasattr(s.open, 'astimezone'):
+                        market_open = s.open.astimezone(eastern)
+                        market_close = s.close.astimezone(eastern)
                     else:
-                        print("⏳ Waiting for market open...")
-                        time.sleep(60)
+                        # s.open and s.close are time objects, assume they're in ET already
+                        market_open = eastern.localize(datetime.combine(now_et.date(), s.open))
+                        market_close = eastern.localize(datetime.combine(now_et.date(), s.close))
+                except Exception as e:
+                    print(f"⚠️ Calendar Check Failed: {e}. Using Default 9:30-16:00 ET.")
+
+                # Check if market is open
+                if now_et < market_open:
+                    time_to_open = (market_open - now_et).total_seconds() / 60
+                    print(f"💤 Pre-Market. Opening in {time_to_open:.0f} mins at {market_open.strftime('%H:%M')} ET")
+                    time.sleep(min(300, time_to_open * 60))  # Sleep up to 5 mins
+                    continue
+                elif now_et > market_close:
+                    print(f"💤 Market Closed (Closed at {market_close.strftime('%H:%M')} ET)")
+                    time.sleep(3600)  # Sleep 1 hour
+                    continue
+                
+                # Market is open - run trading
+                self.run_once()
+                print(f"⏳ Sleeping {interval_minutes} minutes...")
+                time.sleep(interval_minutes * 60)
+                
             except KeyboardInterrupt:
                 print("\n🛑 Stopping bot...")
                 break
