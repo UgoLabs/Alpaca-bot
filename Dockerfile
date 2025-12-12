@@ -1,25 +1,26 @@
 FROM python:3.9-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies (build-essential needed for some numpy/pandas builds)
-RUN apt-get update && apt-get install -y \
-    build-essential \
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first to leverage cache
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code and config
+# Copy project files
+COPY config/ /app/config/
 COPY src/ /app/src/
+COPY scripts/ /app/scripts/
 COPY my_portfolio.txt /app/
+COPY day_trade_list.txt /app/
 COPY .env /app/
-COPY models/ /app/models/
 
-# Set Python path so imports work
-ENV PYTHONPATH="${PYTHONPATH}:/app/src"
+# Set Python path
+ENV PYTHONPATH=/app
 
 # Default command (overridden by docker-compose)
-CMD ["python", "src/bot_standalone.py"]
+CMD ["python", "-m", "src.bots.swing_trader"]

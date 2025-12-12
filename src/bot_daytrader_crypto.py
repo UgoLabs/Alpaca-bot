@@ -26,33 +26,34 @@ class CryptoScalper:
         'DOT/USD', 'ATOM/USD', 'AAVE/USD', 'SHIB/USD', 'ALGO/USD'
     ]
     
-    # ========== SCALPING PARAMETERS ==========
-    PROFIT_TARGET = 0.003     # 0.3% Take Profit (Very fast execution)
-    STOP_LOSS = -0.002        # Stop Loss -0.2% (Tighter!)
-    TRAIL_TRIGGER = 0.002     # Trail starts at +0.2%
-    TRAIL_DISTANCE = 0.001    # Trail distance 0.1%
+    # ========== TREND PARAMETERS (15m) ==========
+    PROFIT_TARGET = 0.008     # 0.8% Target (Quick scalps)
+    STOP_LOSS = -0.003        # 0.3% Stop (Tighter control)
+    TRAIL_TRIGGER = 0.006     # Start trailing at 0.6%
+    TRAIL_DISTANCE = 0.003    # Trail by 0.3%
     
-    MAX_POSITIONS = 20        # Virtually unlimited (covers all 15 symbols)
-    POSITION_SIZE_PCT = 0.065 # 6.5% size allows holding all ~15 symbols (15 * 6.5% ~= 97.5%)
-    SCAN_INTERVAL = 10        # 10s Loop
+    MAX_POSITIONS = 10        # Focused portfolio
+    POSITION_SIZE_PCT = 0.09  # ~10 positions possible
+    SCAN_INTERVAL = 60        # 1 minute scan (slower pace)
+    COOLDOWN_SECONDS = 600    # 10 min cooldown
     
     def __init__(self):
         self.api = tradeapi.REST(self.API_KEY, self.API_SECRET, self.BASE_URL, api_version='v2')
-        self.entry_prices = {}  # Track entry for trailing stops
-        self.peak_prices = {}   # Track peak for trailing
-        self.entry_times = {}   # Track entry time for stale exit
+        self.entry_prices = {}
+        self.peak_prices = {}
+        self.entry_times = {}
+        self.last_exit_times = {}
         
         print("="*60)
-        print("⚡ CRYPTO SCALPING BOT")
+        print("⚡ CRYPTO TREND BOT (15m)")
         print("="*60)
         print(f"📊 Pairs: {len(self.CRYPTO_SYMBOLS)}")
         print(f"🎯 Target: +{self.PROFIT_TARGET*100:.1f}% | Stop: {self.STOP_LOSS*100:.1f}%")
         print(f"📈 Trail: Trigger {self.TRAIL_TRIGGER*100:.1f}% → Distance {self.TRAIL_DISTANCE*100:.1f}%")
-        print(f"⏱️  Scan: Every {self.SCAN_INTERVAL}s")
         print("="*60)
     
-    def get_bars(self, symbol, interval='5m', period='1d'):
-        """Get short-term bars for scalping"""
+    def get_bars(self, symbol, interval='15m', period='5d'):
+        """Get trend bars"""
         try:
             yf_symbol = symbol.replace('/', '-')
             data = yf.download(yf_symbol, period=period, interval=interval, progress=False)
@@ -76,108 +77,80 @@ class CryptoScalper:
             return None
     
     def calculate_scalp_signals(self, df):
-        """Fast scalping indicators"""
-        if df is None or len(df) < 20:
+        """Trend Following Indicators (15m)"""
+        if df is None or len(df) < 50:
             return None
         
         close = df['close']
-        high = df['high']
-        low = df['low']
         volume = df['volume']
         
-        # Fast EMAs for quick signals
-        ema_5 = close.ewm(span=5).mean()
-        ema_13 = close.ewm(span=13).mean()
+        # Trend Indicators
+        ema_9 = close.ewm(span=9).mean()
+        ema_21 = close.ewm(span=21).mean()
+        sma_50 = close.rolling(50).mean()
         
-        # RSI (short period for scalping)
+        # Momentum
         delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(7).mean()
-        loss = -delta.where(delta < 0, 0).rolling(7).mean()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(14).mean()
         rs = gain / loss.replace(0, 1)
         rsi = 100 - (100 / (1 + rs))
         
-        # Stochastic RSI for overbought/oversold
-        rsi_min = rsi.rolling(14).min()
-        rsi_max = rsi.rolling(14).max()
-        stoch_rsi = (rsi - rsi_min) / (rsi_max - rsi_min).replace(0, 1)
+        # Volatility / ATR
+        # (Simplified)
         
-        # Volume spike detection
-        vol_sma = volume.rolling(10).mean()
-        vol_spike = volume.iloc[-1] / vol_sma.iloc[-1] if vol_sma.iloc[-1] > 0 else 1
+        # Trend Status
+        uptrend = (close.iloc[-1] > ema_21.iloc[-1]) and (ema_9.iloc[-1] > ema_21.iloc[-1])
+        strong_uptrend = uptrend and (close.iloc[-1] > sma_50.iloc[-1])
         
-        # Price momentum (last 3 candles)
-        momentum = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100
-        
-        # Micro trend (last 5 candles)
-        micro_trend = "UP" if close.iloc[-1] > close.iloc[-5] > close.iloc[-10] else \
-                      "DOWN" if close.iloc[-1] < close.iloc[-5] < close.iloc[-10] else "FLAT"
-        
-        # Candle strength (current candle body vs range)
-        body = abs(close.iloc[-1] - df['open'].iloc[-1])
-        range_size = high.iloc[-1] - low.iloc[-1]
-        candle_strength = body / range_size if range_size > 0 else 0
-        
-        # Green candle?
-        is_green = close.iloc[-1] > df['open'].iloc[-1]
+        # Volume Check
+        vol_avg = volume.rolling(20).mean()
+        vol_strength = volume.iloc[-1] / vol_avg.iloc[-1] if vol_avg.iloc[-1] > 0 else 1
         
         return {
             'price': close.iloc[-1],
-            'ema_5': ema_5.iloc[-1],
-            'ema_13': ema_13.iloc[-1],
-            'ema_cross_up': ema_5.iloc[-1] > ema_13.iloc[-1] and ema_5.iloc[-2] <= ema_13.iloc[-2],
-            'ema_bullish': ema_5.iloc[-1] > ema_13.iloc[-1],
+            'uptrend': uptrend,
+            'strong_uptrend': strong_uptrend,
             'rsi': rsi.iloc[-1],
-            'stoch_rsi': stoch_rsi.iloc[-1],
-            'vol_spike': vol_spike,
-            'momentum': momentum,
-            'micro_trend': micro_trend,
-            'candle_strength': candle_strength,
-            'is_green': is_green
+            'vol_strength': vol_strength,
+            'ema_9': ema_9.iloc[-1],
+            'ema_21': ema_21.iloc[-1]
         }
-    
+
     def should_scalp_buy(self, signals):
-        """Scalping entry conditions - need multiple confirmations"""
+        """Trend Following Entry Logic"""
         if signals is None:
             return False, 0
-        
+            
         score = 0
         
-        # EMA crossover (strongest signal)
-        if signals['ema_cross_up']:
-            score += 3
-        elif signals['ema_bullish']:
-            score += 1
+        # 1. MUST be in an uptrend (Price > EMA21)
+        if not signals['uptrend']:
+            return False, 0  # Hard reject downtrends
+            
+        score += 1
         
-        # RSI in buy zone (not overbought)
-        if 35 < signals['rsi'] < 65:
-            score += 1
-        
-        # Stochastic RSI oversold bounce
-        if signals['stoch_rsi'] < 0.3:
+        # 2. Strong Uptrend (Above SMA50 too)
+        if signals['strong_uptrend']:
             score += 2
-        elif signals['stoch_rsi'] < 0.5:
-            score += 1
-        
-        # Volume spike (confirms move)
-        if signals['vol_spike'] > 2.0:
+            
+        # 3. RSI Momentum (50-70 is the sweet spot for trends)
+        # Avoid > 75 (Overbought) unless super strong volume
+        if 50 < signals['rsi'] < 75:
             score += 2
-        elif signals['vol_spike'] > 1.5:
+        elif signals['rsi'] >= 75:
+             # Only buy overbought if volume is massive (Climax run)
+             if signals['vol_strength'] > 2.5:
+                 score += 1
+             else:
+                 return False, 0 # risky top
+                 
+        # 4. Volume Support
+        if signals['vol_strength'] > 1.2:
             score += 1
-        
-        # Positive momentum
-        if signals['momentum'] > 0.2:
-            score += 1
-        
-        # Strong green candle
-        if signals['is_green'] and signals['candle_strength'] > 0.6:
-            score += 1
-        
-        # Micro trend alignment
-        if signals['micro_trend'] == 'UP':
-            score += 1
-        
-        # Require high confidence for scalping
-        return score >= 5, score
+            
+        # Threshold: conservative
+        return score >= 4, score
     
     def manage_position(self, position, current_price):
         """Trailing stop management for scalping"""
@@ -253,6 +226,9 @@ class CryptoScalper:
                                 emoji = '✅' if action == 'PROFIT' else '🛑' if action == 'STOP' else '📈'
                                 print(f"   {emoji} {p.symbol}: {reason}")
                                 
+                                # Record exit time for cooldown
+                                self.last_exit_times[p.symbol] = time.time()
+                                
                                 # Cleanup tracking
                                 if p.symbol in self.entry_prices:
                                     del self.entry_prices[p.symbol]
@@ -274,6 +250,10 @@ class CryptoScalper:
                         # Skip if we already own this
                         symbol_clean = symbol.replace('/', '')
                         if symbol_clean in current_symbols:
+                            continue
+                        
+                        # check cooldown
+                        if time.time() - self.last_exit_times.get(symbol_clean, 0) < self.COOLDOWN_SECONDS:
                             continue
                         
                         df = self.get_bars(symbol, interval='5m', period='1d')
@@ -313,7 +293,7 @@ class CryptoScalper:
                                         time_in_force='gtc'
                                     )
                                     print(f"   ⚡ SCALP {symbol}: {qty} @ ${price:.4f}")
-                                    print(f"      Score: {score} | RSI: {sig['rsi']:.0f} | Vol: {sig['vol_spike']:.1f}x")
+                                    print(f"      Score: {score} | RSI: {sig['rsi']:.0f} | Vol: {sig['vol_strength']:.1f}x")
                                     
                             except Exception as e:
                                 print(f"   ❌ {symbol}: {str(e)[:30]}")

@@ -35,7 +35,7 @@ USE_NOISY = True
 MEMORY_SIZE = 500000          # Much larger buffer for high parallelism
 
 # Parallel settings - RTX 4070 can handle 32-64 easily
-NUM_PARALLEL_ENVS = 32        # Number of environments running simultaneously
+NUM_PARALLEL_ENVS = 64        # Number of environments running simultaneously
 MAX_PARALLEL_ENVS = 128       # Maximum allowed
 
 # Risk Management
@@ -441,7 +441,7 @@ class ParallelTrainer:
                 
                 if rolling_sharpe > self.best_avg_sharpe and iteration > 20:
                     self.best_avg_sharpe = rolling_sharpe
-                    self.agent.save("models/SHARED_dqn_best.pth")
+                    self.agent.save("models/SHARED_dqn_best_training.pth")
                     print(f"  *** New Best! Rolling Sharpe: {self.best_avg_sharpe:.2f} ***")
             
             # Save periodically

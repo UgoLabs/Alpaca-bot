@@ -66,8 +66,33 @@ class DuelingNetwork(nn.Module):
         super(DuelingNetwork, self).__init__()
         self.use_noisy = use_noisy
         
-        # Feature extraction
-        self.fc1 = nn.Linear(state_size, 256)
+        # Define Time Series Structure (Must match utils.py)
+        self.window_size = 20
+        self.num_window_features = 11
+        self.time_series_len = self.window_size * self.num_window_features
+        self.static_features_len = state_size - self.time_series_len
+        
+        if self.static_features_len < 0:
+             # Fallback if state size doesn't match window assumption
+             # Just use pure Dense network if dimensions are wrong
+             self.use_gru = False
+             print(f"Warning: State size {state_size} too small for GRU window {self.window_size}. Using Dense.")
+             self.fc1 = nn.Linear(state_size, 256)
+        else:
+            self.use_gru = True
+            # GRU Layer for Time Series
+            self.gru_hidden_size = 128
+            self.gru = nn.GRU(
+                input_size=self.num_window_features, 
+                hidden_size=self.gru_hidden_size, 
+                num_layers=1, 
+                batch_first=True
+            )
+            
+            # Input to FC = GRU_Hidden + Static_Features
+            fc_input_size = self.gru_hidden_size + self.static_features_len
+            self.fc1 = nn.Linear(fc_input_size, 256)
+            
         self.dropout1 = nn.Dropout(0.2)
         self.fc2 = nn.Linear(256, 256)
         self.dropout2 = nn.Dropout(0.2)
@@ -90,7 +115,34 @@ class DuelingNetwork(nn.Module):
             self.advantage = nn.Linear(128, action_size)
             
     def forward(self, state):
-        x = F.relu(self.fc1(state))
+        if hasattr(self, 'use_gru') and self.use_gru:
+            # Split state into Time Series and Static
+            batch_size = state.size(0)
+            
+            # Extract time series part: (Batch, 220)
+            ts_flat = state[:, :self.time_series_len]
+            
+            # Extract static part: (Batch, 11)
+            static_data = state[:, self.time_series_len:]
+            
+            # Reshape Time Series for GRU: (Batch, Sequence, Features) -> (Batch, 20, 11)
+            ts_reshaped = ts_flat.view(batch_size, self.window_size, self.num_window_features)
+            
+            # Output: (Batch, Sequence, Hidden)
+            gru_out, _ = self.gru(ts_reshaped)
+            
+            # Take last time step's hidden state: (Batch, 128)
+            gru_last = gru_out[:, -1, :]
+            
+            # Combine with static features
+            x = torch.cat([gru_last, static_data], dim=1)
+            
+            # Pass to Dense Layers
+            x = F.relu(self.fc1(x))
+        else:
+            # Fallback legacy dense forward
+            x = F.relu(self.fc1(state))
+            
         x = self.dropout1(x)
         x = F.relu(self.fc2(x))
         x = self.dropout2(x)

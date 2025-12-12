@@ -17,14 +17,13 @@ import alpaca_trade_api as tradeapi
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from swing_model import DuelingDQN
-import yfinance as yf
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Load environment variables
 load_dotenv()
 
-MAX_POSITIONS = 20  # Limit max positions to rank best opportunities
+MAX_POSITIONS = 1000  # Virtually unlimited positions
 
 # =============================================================================
 # TECHNICAL INDICATORS (Pure Pandas/Numpy)
@@ -280,58 +279,47 @@ class PaperTrader:
             return None
     
     def get_bulk_bars_yf(self, symbols):
-        """Small-chunk batch fetching - fast and reliable"""
-        import warnings
-        warnings.filterwarnings('ignore')
-        import logging
-        logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+        """Fetch real-time 1-min bars using Alpaca Data API - fast and reliable"""
+        from datetime import datetime, timedelta, timezone
         
-        print(f"   📥 Fetching {len(symbols)} symbols in small batches...")
+        print(f"   📥 Fetching {len(symbols)} symbols via Alpaca (real-time 1-min)...")
         all_bars = {}
-        chunk_size = 10  # Small chunks for reliability
         
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i:i+chunk_size]
-            
+        # Get last 2 days of 1-minute bars
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=2)
+        
+        for symbol in symbols:
             try:
-                # Batch download
-                data = yf.download(
-                    tickers=chunk,
-                    period='1y',
-                    interval='1d',
-                    group_by='ticker',
-                    auto_adjust=True,
-                    progress=False,
-                    threads=False
-                )
+                # Get 1-minute bars with SIP feed
+                bars = self.api.get_bars(
+                    symbol,
+                    '1Min',
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    limit=10000,
+                    feed='sip'
+                ).df
                 
-                if data.empty:
+                if bars.empty or len(bars) < 200:
                     continue
                 
-                # Single symbol in chunk
-                if len(chunk) == 1:
-                    symbol = chunk[0]
-                    df = data.copy()
-                    df.columns = [c.capitalize() if isinstance(c, str) else c for c in df.columns]
-                    if len(df) > 200:
-                        all_bars[symbol] = df
-                else:
-                    # Multiple symbols - use standard MultiIndex access
-                    for symbol in chunk:
-                        try:
-                            if symbol in data.columns.get_level_values(0):
-                                df = data[symbol].copy()
-                                df.columns = [c.capitalize() if isinstance(c, str) else c for c in df.columns]
-                                df = df.dropna()
-                                if len(df) > 200:
-                                    all_bars[symbol] = df
-                        except:
-                            pass
-                            
-            except:
-                pass  # Skip failed chunks
+                # Convert to expected format (OHLCV)
+                df = pd.DataFrame({
+                    'Open': bars['open'],
+                    'High': bars['high'],
+                    'Low': bars['low'],
+                    'Close': bars['close'],
+                    'Volume': bars['volume']
+                })
+                
+                all_bars[symbol] = df
+                
+            except Exception as e:
+                # Skip symbols that fail (delisted, etc)
+                pass
         
-        print(f"   ✓ Received {len(all_bars)}/{len(symbols)} symbols")
+        print(f"   ✓ Received {len(all_bars)}/{len(symbols)} symbols (real-time 1-min)")
         return all_bars
 
     def get_account_info(self):
@@ -576,8 +564,31 @@ class PaperTrader:
                 # Collect Buys for Ranking
                 elif action == 1 and not has_position:  # BUY
                     current_price = float(df['Close'].iloc[-1])
-                    allocation = account['equity'] * 0.05
-                    qty = int(allocation / current_price)
+                    
+                    # RISK MANAGEMENT (Training Style)
+                    risk_per_trade = float(os.getenv("RISK_PER_TRADE", 0.02))
+                    max_pos_pct = 0.25
+                    
+                    # 1. Calculate Risk Amount
+                    risk_amount = float(account['equity']) * risk_per_trade
+                    
+                    # 2. Calculate Stop Distance (using ATR)
+                    current_atr = df['atr'].iloc[-1] if 'atr' in df.columns else current_price * 0.02
+                    stop_distance = current_atr * 2.5  # Match environment (2.5x ATR hard stop)
+                    
+                    # 3. Calculate Shares based on Risk
+                    if stop_distance > 0:
+                        shares_risk = risk_amount / stop_distance
+                    else:
+                        shares_risk = 0
+                    
+                    # 4. Cap at Max Position %
+                    max_capital = float(account['equity']) * max_pos_pct
+                    shares_max_cap = max_capital / current_price
+                    
+                    # Safe Quantity
+                    qty = int(min(shares_risk, shares_max_cap))
+                    
                     if qty > 0:
                         potential_buys.append({
                             'symbol': symbol,
@@ -585,10 +596,10 @@ class PaperTrader:
                             'confidence': confidence,
                             'state': state,
                             'qty': qty,
-                            'atr': df['atr'].iloc[-1] if 'atr' in df.columns else current_price * 0.02
+                            'atr': current_atr
                         })
                     else:
-                        print(f"{symbol:6s} → HOLD (qty 0)")
+                        print(f"{symbol:6s} → HOLD (qty 0 calculated)")
 
                 else:
                     print(f"{symbol:6s} → {action_name} (conf: {confidence:.2f})")
@@ -601,17 +612,14 @@ class PaperTrader:
             # Sort by confidence
             potential_buys.sort(key=lambda x: x['confidence'], reverse=True)
             
-            # Check slots
-            current_positions = len(self.api.list_positions())
-            slots_available = MAX_POSITIONS - current_positions
+            # Check slots (Unlimited now)
+            # current_positions = len(self.api.list_positions())
+            # slots_available = MAX_POSITIONS - current_positions
             
-            if slots_available <= 0:
-                print(f"\n⚠️ Max positions ({MAX_POSITIONS}) reached. Skipping buys.")
-            else:
-                top_picks = potential_buys[:slots_available]
-                print(f"\n🎯 Processing top {len(top_picks)} buys from {len(potential_buys)} candidates:")
-                
-                for pick in top_picks:
+            top_picks = potential_buys  # Process all candidates
+            print(f"\n🎯 Processing {len(top_picks)} buys:")
+            
+            for pick in top_picks:
                     symbol = pick['symbol']
                     try:
                         self.api.submit_order(
@@ -636,7 +644,12 @@ class PaperTrader:
                         }
                         print(f"{symbol:6s} → 🟢 BUY {pick['qty']} @ ${pick['price']:.2f} (conf: {pick['confidence']:.3f})")
                     except Exception as e:
-                        print(f"{symbol:6s} → ❌ BUY FAILED: {str(e)[:30]}")
+                        err_msg = str(e).lower()
+                        if "insufficient buying power" in err_msg:
+                            print(f"   💰 Low Buying Power - Stopping purchases for this cycle.")
+                            break
+                        else:
+                            print(f"{symbol:6s} → ❌ BUY FAILED: {str(e)[:40]}")
         
         # Online Learning: Train on experiences 
         if len(self.replay_buffer) >= 64:

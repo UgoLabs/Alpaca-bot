@@ -7,27 +7,28 @@ import time
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
-import yfinance as yf
 from datetime import datetime, timedelta
 import pytz
 
 # Configuration
-API_KEY = "PKA7TFQVG5OB3YK6UEJ6ZFEGOH"
-API_SECRET = "6ceJ8ZhknodD8iGM2NuMYTpxjr4BMgc5DaoD1xCagtbp"
+# Day Trader API Credentials
+API_KEY = "PKDFX2TU6U2OEHESKR2COK3CPI"
+API_SECRET = "C8TdvTQMjrZc1qourBvzarEZF83NPySv2yWa3EnegqGu"
 BASE_URL = "https://paper-api.alpaca.markets"
 
 PROFIT_TARGET = 0.005  # 0.5% (Quick scalps)
 STOP_LOSS = 0.003      # 0.3% (Tight control)
 MAX_POSITIONS = 10
 COOLDOWN_SECONDS = 300  # 5 min cooldown after exit
-SCAN_INTERVAL = 5       # Scan every 5 seconds
+SCAN_INTERVAL = 30      # Scan every 30 seconds
 
 class PureDayTrader:
     def __init__(self):
         self.api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
         self.symbols = self.load_watchlist()
-        self.last_exit_times = {}  # Track exits for cooldown
-        print(f"🤖 Pure Rule-Based Day Trader (YFinance Data)")
+        self.last_exit_times = {}
+        
+        print(f"🤖 Pure Day Trader (REST API)")
         print(f"📋 Watchlist: {len(self.symbols)} symbols")
         print(f"🎯 Target: +{PROFIT_TARGET*100}% | Stop: -{STOP_LOSS*100}%")
 
@@ -50,58 +51,54 @@ class PureDayTrader:
             return ['NVDA', 'TSLA', 'AMD', 'AAPL', 'MSFT', 'SPY', 'QQQ', 'META', 'AMZN']
 
     def get_bulk_data_yf(self):
-        """Fetch 15min bars using yfinance with chunking for reliability"""
+        """Fetch real-time 1-min bars using Alpaca Data API"""
+        from datetime import datetime, timedelta, timezone
         try:
-            print(f"   Fetching {len(self.symbols)} symbols via yfinance...")
+            print(f"   Fetching {len(self.symbols)} symbols via Alpaca (real-time)...")
             
             all_bars = {}
-            chunk_size = 20  # Process in chunks for reliability
             
-            for i in range(0, len(self.symbols), chunk_size):
-                chunk = self.symbols[i:i+chunk_size]
-                
+            # Get last 2 days of 1-minute bars (timezone-aware)
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=2)
+            
+            for symbol in self.symbols:
                 try:
-                    # Download batch data for chunk
-                    data = yf.download(
-                        tickers=chunk,
-                        period='5d',
-                        interval='15m',
-                        group_by='ticker',
-                        auto_adjust=True,
-                        progress=False,
-                        threads=False
-                    )
+                    # Get 1-minute bars (real-time) with SIP feed
+                    bars = self.api.get_bars(
+                        symbol,
+                        '1Min',
+                        start=start.isoformat(),
+                        end=end.isoformat(),
+                        limit=10000,
+                        feed='sip'  # Use paid SIP data feed
+                    ).df
                     
-                    if data.empty:
+                    if bars.empty or len(bars) < 50:
                         continue
                     
-                    # Single symbol in chunk
-                    if len(chunk) == 1:
-                        symbol = chunk[0]
-                        df = data.copy()
-                        df.columns = df.columns.str.lower()
-                        if len(df) >= 50:
-                            all_bars[symbol] = df
-                    else:
-                        # Multiple symbols
-                        for symbol in chunk:
-                            try:
-                                if symbol in data.columns.get_level_values(0):
-                                    df = data[symbol].copy()
-                                    df.columns = df.columns.str.lower()
-                                    df = df.dropna()
-                                    if len(df) >= 50:
-                                        all_bars[symbol] = df
-                            except:
-                                pass
-                except:
-                    pass  # Skip failed chunks
+                    # Convert to expected format
+                    df = pd.DataFrame({
+                        'open': bars['open'],
+                        'high': bars['high'],
+                        'low': bars['low'],
+                        'close': bars['close'],
+                        'volume': bars['volume']
+                    })
+                    
+                    all_bars[symbol] = df
+                    
+                except Exception as e:
+                    # Log first few errors for debugging
+                    if len(all_bars) < 3:
+                        print(f"   Debug: {symbol} failed - {str(e)[:50]}")
+                    pass
             
-            print(f"   ✓ Received {len(all_bars)} symbols")
+            print(f"   ✓ Received {len(all_bars)} symbols (real-time)")
             return all_bars
             
         except Exception as e:
-            print(f"   ⚠️ YFinance error: {e}")
+            print(f"   ⚠️ Alpaca error: {e}")
             return {}
 
     def calculate_signals(self, df):

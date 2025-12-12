@@ -7,7 +7,6 @@ import os
 import time
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import alpaca_trade_api as tradeapi
 from datetime import datetime, timedelta
 from swing_model import DuelingDQN
@@ -16,21 +15,33 @@ import torch
 import pickle
 from collections import deque
 
-# New Paper Account Credentials
-API_KEY = "PKBE4KSRXPQCWYQGRJSS5TAGNT"
-API_SECRET = "4syiQj2mVnR8hKkk8gopJJA1wcCF2p2iTpiaBfZnBRW4"
+# Money Scraper API Credentials (Fresh keys for WebSocket)
+API_KEY = "PK5EWIG3M7IDV2KL7WW4VUBSRJ"
+API_SECRET = "DRuaa1fLvg1n3vxCBtnqcw55FEbdkf7NJZr5yhdZ5Vva"
 BASE_URL = "https://paper-api.alpaca.markets"
 
 # Money Scraper Settings
-PROFIT_TARGET_DOLLARS = 5.0   # Exit at +$5 profit
-STOP_LOSS_DOLLARS = 2.0       # Exit at -$2 loss
-MAX_POSITIONS = 10            # Max 10 positions - pick best AI signals
-SCAN_INTERVAL_SECONDS = 5     # Scan every 5 seconds for faster stops
+# Replaced dollar-based P/L with Percentage-based
+PROFIT_TARGET_PCT = 0.04      # Exit at +4% profit
+STOP_LOSS_PCT = 0.02          # Exit at -2% loss
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.02))
+MAX_POSITIONS = 8             # Max 8 positions
+SCAN_INTERVAL_SECONDS = 5     # Scan every 5s
 
 
 class MoneyScraperBot:
     def __init__(self, model_path='models/SHARED_dqn_best.pth'):
         self.api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+        
+        # WebSocket Stream for real-time data (NO API LIMITS!)
+        self.stream = tradeapi.Stream(
+            API_KEY, 
+            API_SECRET, 
+            BASE_URL,
+            data_feed='sip'  # Use paid SIP data
+        )
+        self.bar_cache = {}  # In-memory cache
+        self.stream_ready = False
         
         # Load AI Model
         state_size = 231
@@ -42,9 +53,34 @@ class MoneyScraperBot:
         # Load stock symbols from portfolio
         self.symbols = self.load_portfolio()
         
+        # Initialize cache
+        for symbol in self.symbols:
+            self.bar_cache[symbol] = deque(maxlen=500)
+        
+        # Start WebSocket stream
+        import threading
+        import asyncio
+        
+        async def bar_handler(bar):
+            if bar.symbol in self.bar_cache:
+                self.bar_cache[bar.symbol].append({
+                    'Open': bar.open, 'High': bar.high,
+                    'Low': bar.low, 'Close': bar.close,
+                    'Volume': bar.volume
+                })
+                if not self.stream_ready and len(self.bar_cache[bar.symbol]) >= 10:
+                    ready = sum(1 for s in self.symbols if len(self.bar_cache.get(s,[])) >= 10)
+                    if ready >= len(self.symbols) * 0.1:
+                        self.stream_ready = True
+                        print(f"✅ Stream ready: {ready}/{len(self.symbols)} symbols")
+        
+        self.stream.subscribe_bars(bar_handler, *self.symbols)
+        threading.Thread(target=lambda: asyncio.run(self.stream._run_forever()), daemon=True).start()
+        print(f"🌐 WebSocket streaming {len(self.symbols)} symbols...")
+        
         # Online Learning Components
-        self.replay_buffer = deque(maxlen=10000)  # Store recent experiences
-        self.position_states = {}  # Track entry states for open positions
+        self.replay_buffer = deque(maxlen=10000)
+        self.position_states = {}
         self.optimizer = torch.optim.Adam(self.agent.model.parameters(), lr=0.0001)
         self.scan_count = 0
         
@@ -63,7 +99,7 @@ class MoneyScraperBot:
         print(f"{'='*60}")
         print(f"📊 Model: {model_path}")
         print(f"📋 Portfolio: {len(self.symbols)} stocks")
-        print(f"🎯 Profit: +${PROFIT_TARGET_DOLLARS} | Stop: -${STOP_LOSS_DOLLARS}")
+        print(f"🎯 Profit: {PROFIT_TARGET_PCT*100}% | Stop: -{STOP_LOSS_PCT*100}%")
         print(f"🔢 Max Positions: {MAX_POSITIONS}")
         print(f"🧠 Online Learning: ENABLED")
         print(f"{'='*60}\n")
@@ -83,70 +119,77 @@ class MoneyScraperBot:
         return ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA']  # Fallback
     
     def get_bulk_data(self, symbols):
-        """Fetch daily data for multiple symbols using yfinance"""
+        """Get data from WebSocket cache (instant!) or REST API as fallback"""
         all_bars = {}
-        chunk_size = 20
         
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i:i+chunk_size]
+        # PRIORITY 1: Use WebSocket cache (instant, no API calls)
+        for symbol in symbols:
+            if symbol in self.bar_cache and len(self.bar_cache[symbol]) >= 10:
+                bars_list = list(self.bar_cache[symbol])
+                df = pd.DataFrame(bars_list)
+                all_bars[symbol] = df
+        
+        # If stream is ready, return cached data
+        if self.stream_ready:
+            return all_bars
+        
+        # FALLBACK: Use REST API (only during startup while stream initializes)
+        print(f"   ⏳ Stream initializing, using REST API...")
+        from datetime import datetime, timedelta, timezone
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=2)
+        
+        for symbol in symbols:
             try:
-                data = yf.download(
-                    tickers=chunk,
-                    period='1y',
-                    interval='1d',
-                    group_by='ticker',
-                    progress=False,
-                    auto_adjust=True
-                )
+                # Get 1-minute bars with SIP feed
+                bars = self.api.get_bars(
+                    symbol,
+                    '1Min',
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    limit=10000,
+                    feed='sip'
+                ).df
                 
-                if data.empty:
+                if bars.empty or len(bars) < 200:
                     continue
                 
-                if len(chunk) == 1:
-                    symbol = chunk[0]
-                    df = data.copy()
-                    df.columns = [c.capitalize() for c in df.columns]
-                    if len(df) >= 200:
-                        all_bars[symbol] = df
-                else:
-                    for symbol in chunk:
-                        try:
-                            if symbol in data.columns.get_level_values(0):
-                                df = data[symbol].copy()
-                                df.columns = [c.capitalize() for c in df.columns]
-                                df = df.dropna()
-                                if len(df) >= 200:
-                                    all_bars[symbol] = df
-                        except:
-                            pass
-            except:
+                # Convert to expected format (OHLCV)
+                df = pd.DataFrame({
+                    'Open': bars['open'],
+                    'High': bars['high'],
+                    'Low': bars['low'],
+                    'Close': bars['close'],
+                    'Volume': bars['volume']
+                })
+                
+                all_bars[symbol] = df
+                
+            except Exception as e:
+                # Skip symbols that fail (delisted, etc)
                 pass
         
         return all_bars
     
-    def get_ai_action(self, symbol, df):
+    def get_ai_action(self, symbol, df, account=None, position=None):
         """Get AI model's action for a symbol and confidence score"""
         try:
             df = add_technical_indicators(df)
             current_step = len(df) - 1
-            market_state = normalize_state(df, current_step, 20)  # Fixed: added window_size=20
+            market_state = normalize_state(df, current_step, 20)
             
-            # Get account info
-            try:
-                account = self.api.get_account()
+            # Use cached account info or defaults
+            if account:
                 equity = float(account.equity)
                 cash = float(account.cash)
-            except:
-                equity = 10000
-                cash = 10000
+            else:
+                equity = 10000.0
+                cash = 10000.0
             
-            # Check if we have a position
-            market_value = 0
-            try:
-                position = self.api.get_position(symbol)
+            # Use cached position info
+            market_value = 0.0
+            if position:
                 market_value = float(position.market_value)
-            except:
-                pass
             
             portfolio_state = np.array([
                 cash / equity,
@@ -164,11 +207,11 @@ class MoneyScraperBot:
                 state_tensor = torch.FloatTensor(state).unsqueeze(0)
                 q_values = self.agent.model(state_tensor)
                 action = q_values.argmax(1).item()
-                confidence = q_values[0][action].item()  # Q-value for selected action
+                confidence = q_values[0][action].item()
             
-            return action, confidence  # 0=HOLD, 1=BUY, 2=SELL + confidence
+            return action, confidence
         except Exception as e:
-            print(f"   ⚠️ AI action error for {symbol}: {str(e)[:50]}")
+            # print(f"   ⚠️ AI action error for {symbol}: {str(e)[:50]}")
             return 0, 0.0
     
     def store_experience(self, symbol, state, action, next_state, reward):
@@ -232,29 +275,40 @@ class MoneyScraperBot:
                     entry_price = float(p.avg_entry_price)
                     current_price = float(p.current_price)
                     
-                    # Calculate P/L in dollars
-                    total_pnl = (current_price - entry_price) * qty
+                    # Calculate P/L in percentage and dollars
+                    pnl_pct = float(p.unrealized_plpc)
+                    total_pnl = float(p.unrealized_pl)
                     
-                    # Check profit target
-                    if total_pnl >= PROFIT_TARGET_DOLLARS:
+                    # Check profit target (e.g. +4%)
+                    if pnl_pct >= PROFIT_TARGET_PCT:
+                        # Cancel any open orders first to avoid conflicts
+                        try:
+                            self.api.cancel_all_orders()
+                        except:
+                            pass
                         self.api.close_position(symbol)
-                        print(f"   ✅ {symbol:6s} PROFIT: ${total_pnl:+.2f} ({qty:.0f} shares)")
+                        print(f"   ✅ {symbol:6s} PROFIT: {pnl_pct*100:+.2f}% (${total_pnl:+.2f})")
                         # Store experience
                         if symbol in self.position_states:
                             self.store_experience(symbol, self.position_states[symbol]['state'], 1, self.position_states[symbol]['state'], total_pnl)
                             del self.position_states[symbol]
                     
-                    # Check stop loss
-                    elif total_pnl <= -STOP_LOSS_DOLLARS:
+                    # Check stop loss (e.g. -2%)
+                    elif pnl_pct <= -STOP_LOSS_PCT:
+                        # Cancel any open orders first to avoid conflicts
+                        try:
+                            self.api.cancel_all_orders()
+                        except:
+                            pass
                         self.api.close_position(symbol)
-                        print(f"   🛑 {symbol:6s} STOP: ${total_pnl:+.2f} ({qty:.0f} shares)")
+                        print(f"   🛑 {symbol:6s} STOP: {pnl_pct*100:+.2f}% (${total_pnl:+.2f})")
                         # Store experience
                         if symbol in self.position_states:
                             self.store_experience(symbol, self.position_states[symbol]['state'], 1, self.position_states[symbol]['state'], total_pnl)
                             del self.position_states[symbol]
                     
                     else:
-                        print(f"   💎 {symbol:6s} ${total_pnl:+.2f} ({current_price:.2f})")
+                        print(f"   💎 {symbol:6s} {pnl_pct*100:+.2f}% (${total_pnl:+.2f})")
                 
                 except Exception as e:
                     print(f"   ⚠️ {p.symbol}: {str(e)[:30]}")
@@ -290,82 +344,76 @@ class MoneyScraperBot:
             # Analyze each symbol and collect BUY signals with confidence
             buy_signals = []  # List of (symbol, price, confidence)
             
+            # Fetch account info ONCE
+            try:
+                account = self.api.get_account()
+            except:
+                account = None
+            
+            # Create position map for fast lookup
+            position_map = {p.symbol: p for p in positions}
+            
             for symbol, df in all_data.items():
                 if symbol in held_symbols:
                     continue
                 
-                action, confidence = self.get_ai_action(symbol, df)
+                # Get current price
+                current_price = df.iloc[-1]['Close']
                 
-                if action == 1:  # AI says BUY
-                    current_price = float(df['Close'].iloc[-1])
+                # Get AI action with cached account/position data
+                action, confidence = self.get_ai_action(symbol, df, account=account, position=position_map.get(symbol))
+                
+                # Check for BUY signal (1) with high confidence
+                if action == 1 and confidence > 0.5:
                     buy_signals.append((symbol, current_price, confidence))
             
-            # Rank by confidence and take top N
+            # Sort signals by confidence (highest first)
+            buy_signals.sort(key=lambda x: x[2], reverse=True)
+            
             if buy_signals:
                 print(f"\n🎯 AI Recommendations: {len(buy_signals)} BUY signals")
                 
-                # Sort by confidence (highest first)
-                buy_signals.sort(key=lambda x: x[2], reverse=True)
-                
-                # Take only top N slots available
+                # Take top N signals to fill slots
                 top_picks = buy_signals[:num_open_slots]
                 
                 if len(buy_signals) > num_open_slots:
                     print(f"   📊 Ranked top {len(top_picks)} from {len(buy_signals)} candidates")
                 
-                try:
-                    account = self.api.get_account()
-                    cash = float(account.cash)
-                except:
-                    cash = 1000
-                
-                # Split cash equally among top picks
-                allocation_per_stock = cash / len(top_picks) if len(top_picks) > 0 else 0
-                
-                for symbol, price, confidence in top_picks:
-                    qty = int(allocation_per_stock / price)
+                for pick in top_picks:
+                    symbol, price, confidence = pick
+                    
+                    # Calculate quantity based on position size limit ($200 per trade?)
+                    # Dynamic sizing: Use 10% of equity or fixed amount?
+                    # Let's use simpler logic: 1 share for expensive, more for cheap
+                    # Better: Allocate remaining buying power / open slots
+                    if account:
+                        buying_power = float(account.daytrading_buying_power)
+                    else:
+                        buying_power = 20000.0
+                    
+                    # Allocate portion of BP
+                    allocation = min(2000.0, buying_power / max(1, num_open_slots)) # Cap at $2k per trade
+                    qty = int(allocation / price)
                     
                     if qty > 0:
                         try:
-                            # Submit BUY order
+                            # Calculate stop and profit prices
+                            stop_price = round(price - (STOP_LOSS_DOLLARS / qty), 2)
+                            take_profit_price = round(price + (PROFIT_TARGET_DOLLARS / qty), 2)
+                            
+                            # Submit BRACKET order (BUY + STOP + PROFIT in one atomic order)
                             self.api.submit_order(
                                 symbol=symbol,
                                 qty=qty,
                                 side='buy',
                                 type='market',
-                                time_in_force='day'
+                                time_in_force='day',
+                                order_class='bracket',
+                                stop_loss={'stop_price': stop_price},
+                                take_profit={'limit_price': take_profit_price}
                             )
                             print(f"   🟢 BUY {symbol}: {qty} @ ${price:.2f} (conf: {confidence:.3f})")
-                            
-                            # Submit STOP-LOSS order immediately (server-side protection)
-                            stop_price = round(price - (STOP_LOSS_DOLLARS / qty), 2)
-                            try:
-                                self.api.submit_order(
-                                    symbol=symbol,
-                                    qty=qty,
-                                    side='sell',
-                                    type='stop',
-                                    stop_price=stop_price,
-                                    time_in_force='day'
-                                )
-                                print(f"   🛡️ STOP set for {symbol} @ ${stop_price:.2f}")
-                            except Exception as e:
-                                print(f"   ⚠️ Stop order failed for {symbol}: {str(e)[:30]}")
-                            
-                            # Submit TAKE-PROFIT order (server-side limit sell)
-                            take_profit_price = round(price + (PROFIT_TARGET_DOLLARS / qty), 2)
-                            try:
-                                self.api.submit_order(
-                                    symbol=symbol,
-                                    qty=qty,
-                                    side='sell',
-                                    type='limit',
-                                    limit_price=take_profit_price,
-                                    time_in_force='day'
-                                )
-                                print(f"   🎯 PROFIT set for {symbol} @ ${take_profit_price:.2f}")
-                            except Exception as e:
-                                print(f"   ⚠️ Profit order failed for {symbol}: {str(e)[:30]}")
+                            print(f"   🛡️ STOP @ ${stop_price:.2f} | 🎯 PROFIT @ ${take_profit_price:.2f}")
                                 
                         except Exception as e:
                             print(f"   ❌ {symbol}: {str(e)[:30]}")
@@ -410,12 +458,18 @@ class MoneyScraperBot:
                     positions = self.api.list_positions()
                     if positions:
                         print(f"\n🔔 EOD LIQUIDATION: Closing {len(positions)} positions...")
+                        # Cancel all open orders first to avoid conflicts
+                        try:
+                            self.api.cancel_all_orders()
+                            print("   🚫 Cancelled all open orders")
+                        except:
+                            pass
                         for p in positions:
                             try:
                                 self.api.close_position(p.symbol)
                                 print(f"   📤 Closed {p.symbol}")
-                            except:
-                                pass
+                            except Exception as e:
+                                print(f"   ⚠️ Failed to close {p.symbol}: {str(e)[:30]}")
                         print("✅ All positions liquidated for EOD")
                         time.sleep(900)  # Wait 15 mins
                         continue

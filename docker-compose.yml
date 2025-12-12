@@ -1,42 +1,47 @@
 version: '3.8'
 
 services:
-  # 🤖 Day Trader Bot (Paper Account 2)
-  daytrader:
+  # Money Scraper - High Frequency Scalper (WebSocket)
+  moneyscraper:
     build: .
-    container_name: alpaca_daytrader
-    command: python src/bot_daytrader_pure.py
-    restart: unless-stopped
+    container_name: alpaca_moneyscraper
+    command: python -m src.bots.money_scraper
     volumes:
-      - ./models:/app/models # Save models/logs to host
+      - ./models:/app/models
       - ./logs:/app/logs
-      - ./my_portfolio.txt:/app/my_portfolio.txt # Allow editing portfolio on host
-      - ./.env:/app/.env
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - BOT_NAME=money_scraper
+    restart: unless-stopped
 
-  # 🤖 Swing Trader Bot (Paper Account 1)
+  # Swing Trader - Multi-day Positions
   swingtrader:
     build: .
     container_name: alpaca_swingtrader
-    command: python src/bot_standalone.py
-    restart: unless-stopped
+    command: python -m src.bots.swing_trader
     volumes:
-      - ./models:/app/models # Save learned model to host!
+      - ./models:/app/models
       - ./logs:/app/logs
-      - ./my_portfolio.txt:/app/my_portfolio.txt
-      - ./.env:/app/.env
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - BOT_NAME=swing_trader
+    restart: unless-stopped
 
-  # 🪙 Crypto Day Trader Bot (Paper Account 3)
-  cryptotrader:
+  # Day Trader - Intraday Scalper
+  daytrader:
     build: .
-    container_name: alpaca_cryptotrader
-    command: python src/bot_daytrader_crypto.py
-    restart: unless-stopped
+    container_name: alpaca_daytrader
+    command: python -m src.bots.day_trader
     volumes:
+      - ./models:/app/models
       - ./logs:/app/logs
-      - ./.env:/app/.env
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - BOT_NAME=day_trader
+    restart: unless-stopped
