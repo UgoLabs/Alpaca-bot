@@ -5,7 +5,7 @@ Shared functionality for all trading bots
 import os
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import deque
 
@@ -201,8 +201,12 @@ class BaseBot(ABC):
         """Main trading loop with strict market hours management."""
         print(f"🚀 Starting {self.__class__.__name__} (interval: {interval_seconds}s)")
         
-        # 5 minute pre-market warmup
-        WARMUP_MINUTES = 5
+        # Schedule configuration
+        WARMUP_MINUTES = 10
+        LIQUIDATION_MINUTES = 10
+        
+        # Flag to prevent re-liquidation or re-training multiple times a day
+        has_liquidated_today = False
         
         while True:
             try:
@@ -213,22 +217,22 @@ class BaseBot(ABC):
                 if market_open is None:
                     print(f"💤 Market Closed (Holiday). Sleeping 1 hour.")
                     time.sleep(3600)
+                    has_liquidated_today = False
                     continue
                 
-                # Timestamps
+                # Define key timestamps
                 warmup_time = market_open - timedelta(minutes=WARMUP_MINUTES)
+                liquidation_time = market_close - timedelta(minutes=LIQUIDATION_MINUTES)
                 
-                # Case 2: Before Warmup Time (Deep Sleep)
+                # Case 2: Before Warmup (Deep Sleep)
                 if now_et < warmup_time:
                     sleep_seconds = (warmup_time - now_et).total_seconds()
-                    # Sleep in chunks to allow interrupts, but max sleep
                     print(f"💤 Market Closed. Deep sleep until {warmup_time.strftime('%H:%M')} ET ({sleep_seconds/3600:.1f} hours).")
-                    
-                    # Sleep until warmup (cap at 6 hours to periodic check)
+                    has_liquidated_today = False # Reset for the new day
                     time.sleep(min(sleep_seconds, 21600)) 
                     continue
                 
-                # Case 3: Warmup Phase (5 mins before open)
+                # Case 3: Warmup Phase (10 mins before open)
                 if warmup_time <= now_et < market_open:
                     print(f"🔥 Pre-Market Warmup ({WARMUP_MINUTES} mins before open)...")
                     self.on_warmup()
@@ -237,28 +241,52 @@ class BaseBot(ABC):
                     while datetime.now(self.eastern) < market_open:
                         time.sleep(10)
                     print("🔔 Market is OPEN!")
+                    continue
                 
-                # Case 4: Market Open
-                if market_open <= now_et <= market_close:
+                # Case 4: Market Open (Trading Session)
+                if market_open <= now_et < liquidation_time:
+                    # Reset liquidation flag if we somehow wrapped around (failsafe)
+                    if has_liquidated_today and now_et < liquidation_time:
+                        has_liquidated_today = False
+                        
                     self.run_once()
                     
-                    # Compute sleep time (account for execution time)
-                    # We want to maintain exact interval cadence if possible
                     print(f"⏳ Next scan in {interval_seconds}s...")
                     time.sleep(interval_seconds)
                     continue
                 
-                # Case 5: After Market Close
-                if now_et > market_close:
-                    print("🔔 Market Closed. Shutting down systems.")
-                    self.on_shutdown()
+                # Case 5: EOD Liquidation Window (10 mins before close)
+                if liquidation_time <= now_et < market_close:
+                    if not has_liquidated_today:
+                        print(f"🛑 EOD WINDOW ({LIQUIDATION_MINUTES} mins to close) - Stopping Trading & Liquidating.")
+                        
+                        # 1. Liquidate if configured
+                        if hasattr(self, 'config') and getattr(self.config, 'LIQUIDATE_EOD', False):
+                            self._liquidate_all_positions()
+                        
+                        # 2. Train on Daily Experiences
+                        if hasattr(self, 'config') and getattr(self.config, 'ONLINE_LEARNING', False):
+                            print("🧠 Running EOD Online Training...")
+                            loss = self.train_on_experiences(batch_size=64) # Train on a larger batch at EOD
+                            print(f"🧠 EOD Training Complete. Loss: {loss:.4f}")
+                            self._save_experiences()
+                        
+                        has_liquidated_today = True
                     
-                    # Calculate time until tomorrow's warmup
-                    # Basic logic: Sleep 1 hour then loop will recalc tomorrow's schedule
-                    print("💤 sleeping until tomorrow...")
-                    time.sleep(3600)
+                    # Sleep until market close to prevent re-entering
+                    sleep_seconds = (market_close - datetime.now(self.eastern)).total_seconds()
+                    if sleep_seconds > 0:
+                        print(f"💤 Sleeping until Market Close ({sleep_seconds:.0f}s)...")
+                        time.sleep(sleep_seconds + 5) # Sleep past close
                     continue
-                
+
+                # Case 6: After Close (Market just closed)
+                if now_et >= market_close:
+                    print("🏁 Market Closed.")
+                    self.on_shutdown()
+                    time.sleep(60) # Wait a minute before restarting loop to hit Deep Sleep
+                    continue
+
             except KeyboardInterrupt:
                 print("\n🛑 Stopping bot...")
                 self.on_shutdown()
@@ -266,11 +294,100 @@ class BaseBot(ABC):
             except Exception as e:
                 print(f"❌ Error in run_loop: {e}")
                 time.sleep(60)
+                
+                time.sleep(60)
 
     def on_warmup(self):
         """Called 5 mins before market open. Override in subclasses."""
         pass
-        
+    
     def on_shutdown(self):
-        """Called after market close. Override in subclasses."""
-        pass
+        """Called after market close. Handles EOD liquidation if configured."""
+        # Check if this bot should liquidate at EOD
+        if hasattr(self, 'config') and getattr(self.config, 'LIQUIDATE_EOD', False):
+            self._liquidate_all_positions()
+        
+        # Save any learned experiences
+        if len(self.replay_buffer) > 0:
+            self._save_experiences()
+    
+    def _liquidate_all_positions(self):
+        """Close all open positions (EOD cleanup)."""
+        try:
+            positions = self.api.list_positions()
+            if not positions:
+                print("🔔 EOD: No positions to liquidate")
+                return
+            
+            print(f"🔔 EOD LIQUIDATION: Closing {len(positions)} positions...")
+            
+            for p in positions:
+                try:
+                    self.api.close_position(p.symbol)
+                    pnl = float(p.unrealized_pl)
+                    emoji = "✅" if pnl >= 0 else "🛑"
+                    print(f"   {emoji} {p.symbol}: ${pnl:+.2f}")
+                    
+                    # Store experience for learning
+                    if p.symbol in self.position_states:
+                        self._record_trade_experience(p.symbol, pnl, "EOD")
+                        
+                except Exception as e:
+                    print(f"   ❌ Failed to close {p.symbol}: {e}")
+            
+            print("🔔 EOD: Liquidation complete")
+            
+        except Exception as e:
+            print(f"❌ EOD Liquidation error: {e}")
+    
+    def _record_trade_experience(self, symbol, pnl, exit_type):
+        """Record a completed trade as experience for online learning."""
+        if symbol not in self.position_states:
+            return
+        
+        entry_state = self.position_states[symbol].get('state')
+        if entry_state is None:
+            return
+        
+        # Calculate reward based on PnL
+        # Normalize reward to reasonable range
+        reward = np.clip(pnl / 100, -2, 2)  # $100 = 1.0 reward
+        
+        # Boost reward for profitable exits
+        if exit_type == "PROFIT":
+            reward *= 1.5
+        elif exit_type == "STOP":
+            reward *= 0.8  # Slightly less penalty for disciplined stops
+        
+        # Store experience (state, action=1 for buy, reward, next_state, done=True)
+        # Note: We don't have perfect next_state, use entry_state as approximation
+        self.replay_buffer.append((entry_state, 1, reward, entry_state, True))
+        
+        # Clean up
+        del self.position_states[symbol]
+    
+    def _save_experiences(self):
+        """Save replay buffer for persistence across restarts."""
+        try:
+            import pickle
+            from config.settings import REPLAY_BUFFER_PATH
+            with open(REPLAY_BUFFER_PATH, 'wb') as f:
+                pickle.dump(list(self.replay_buffer), f)
+            print(f"💾 Saved {len(self.replay_buffer)} experiences")
+        except Exception as e:
+            print(f"⚠️ Could not save experiences: {e}")
+    
+    def _load_experiences(self):
+        """Load replay buffer from disk."""
+        try:
+            import pickle
+            from config.settings import REPLAY_BUFFER_PATH
+            import os
+            if os.path.exists(REPLAY_BUFFER_PATH):
+                with open(REPLAY_BUFFER_PATH, 'rb') as f:
+                    experiences = pickle.load(f)
+                    for exp in experiences:
+                        self.replay_buffer.append(exp)
+                print(f"📂 Loaded {len(experiences)} saved experiences")
+        except Exception as e:
+            print(f"⚠️ Could not load experiences: {e}")

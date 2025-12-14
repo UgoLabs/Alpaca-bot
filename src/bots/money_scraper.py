@@ -13,7 +13,7 @@ import alpaca_trade_api as tradeapi
 
 from config.settings import (
     MoneyScraperCreds, MoneyScraperConfig, 
-    ALPACA_BASE_URL, RISK_PER_TRADE, SHARED_MODEL_PATH
+    ALPACA_BASE_URL, RISK_PER_TRADE, SCALPER_MODEL_PATH, SHARED_MODEL_PATH
 )
 from src.bots.base_bot import BaseBot
 from src.core.indicators import add_technical_indicators
@@ -30,10 +30,14 @@ class MoneyScraperBot(BaseBot):
     """
     
     def __init__(self):
+        # Use scalper model if exists, otherwise fall back to shared
+        import os
+        model_path = str(SCALPER_MODEL_PATH) if os.path.exists(SCALPER_MODEL_PATH) else str(SHARED_MODEL_PATH)
+        
         super().__init__(
             api_key=MoneyScraperCreds.API_KEY,
             api_secret=MoneyScraperCreds.API_SECRET,
-            model_path=str(SHARED_MODEL_PATH),
+            model_path=model_path,
             watchlist_file=MoneyScraperConfig.WATCHLIST
         )
         
@@ -41,8 +45,13 @@ class MoneyScraperBot(BaseBot):
         
         # WebSocket streaming
         if self.config.USE_WEBSOCKET:
-            self.stream = None  # Lazy init in on_warmup
+            self.stream = None
             self.bar_cache = {symbol: deque(maxlen=200) for symbol in self.symbols}
+            
+            # Initialize WebSocket immediately if market is open
+            if self.is_market_open():
+                print("🔌 Market is OPEN - Initializing WebSocket immediately...")
+                self._setup_websocket()
         else:
             self.stream = None
             self.bar_cache = {}
@@ -109,24 +118,50 @@ class MoneyScraperBot(BaseBot):
         # Subscribe and start in background
         self.stream.subscribe_bars(bar_handler, *self.symbols)
         Thread(target=self.stream.run, daemon=True).start()
-        print("🔌 WebSocket streaming started")
+        print("🔌 WebSocket streaming started (1Min bars → 5Min aggregation)")
+    
+    def _aggregate_to_5min(self, bars_1min):
+        """
+        Aggregate 1-minute bars into 5-minute bars.
+        This ensures the AI model receives data matching its training timeframe.
+        """
+        if len(bars_1min) < 5:
+            return None
+        
+        df = pd.DataFrame(list(bars_1min))
+        df.columns = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to 5-minute bars
+        df_5min = df.resample('5Min').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+        
+        if len(df_5min) < 20:  # Need enough bars for indicators
+            return None
+        
+        return df_5min.reset_index()
     
     def get_data(self, symbol):
         """Get market data for a symbol (WebSocket cache or REST fallback)."""
-        # Try WebSocket cache first
-        if self.stream and symbol in self.bar_cache and len(self.bar_cache[symbol]) >= 10:
-            df = pd.DataFrame(list(self.bar_cache[symbol]))
-            df.columns = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
-            df.set_index('timestamp', inplace=True)
-            return add_technical_indicators(df)
+        # Try WebSocket cache first (aggregate 1Min → 5Min)
+        if self.stream and symbol in self.bar_cache and len(self.bar_cache[symbol]) >= 100:
+            df_5min = self._aggregate_to_5min(self.bar_cache[symbol])
+            if df_5min is not None:
+                return add_technical_indicators(df_5min)
         
-        # REST API fallback
+        # REST API fallback - use 5Min bars directly (matches training!)
         try:
             end = datetime.now()
             start = end - timedelta(days=5)
             bars = self.api.get_bars(
                 symbol,
-                '1Min',
+                '5Min',  # Changed from 1Min to match training
                 start=start.strftime('%Y-%m-%d'),
                 end=end.strftime('%Y-%m-%d'),
                 limit=200,
@@ -260,19 +295,26 @@ class MoneyScraperBot(BaseBot):
                 print(f"\n🎯 Executing {len(top_picks)} buys:")
                 for pick in top_picks:
                     try:
+                        # Calculate prices for Bracket Order
+                        tp_price = round(pick['price'] * (1 + self.config.PROFIT_TARGET_PCT), 2)
+                        sl_price = round(pick['price'] * (1 - self.config.STOP_LOSS_PCT), 2)
+                        
                         self.api.submit_order(
                             symbol=pick['symbol'],
                             qty=pick['qty'],
                             side='buy',
                             type='market',
-                            time_in_force='day'
+                            time_in_force='day',
+                            order_class='bracket',
+                            take_profit={'limit_price': tp_price},
+                            stop_loss={'stop_price': sl_price}
                         )
                         self.position_states[pick['symbol']] = {
                             'state': pick['state'],
                             'entry_price': pick['price'],
                             'entry_time': datetime.now()
                         }
-                        print(f"   🟢 {pick['symbol']:6s} BUY {pick['qty']} @ ${pick['price']:.2f}")
+                        print(f"   🟢 {pick['symbol']:6s} BUY {pick['qty']} @ ${pick['price']:.2f} (OCO: ${tp_price:.2f} / ${sl_price:.2f})")
                     except Exception as e:
                         err_msg = str(e).lower()
                         if "insufficient buying power" in err_msg:
@@ -291,6 +333,12 @@ class MoneyScraperBot(BaseBot):
         
         self.check_exits()
         self.scan_for_entries()
+        
+        # Online Learning: Train on accumulated experiences
+        if self.config.ONLINE_LEARNING and len(self.replay_buffer) >= 32:
+            loss = self.train_on_experiences(batch_size=32)
+            if loss > 0:
+                print(f"🧠 Online Learning: Loss={loss:.4f} (Buffer: {len(self.replay_buffer)})")
         
         print(f"\n{'='*60}")
 

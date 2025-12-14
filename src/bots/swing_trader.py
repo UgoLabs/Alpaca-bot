@@ -10,7 +10,7 @@ import numpy as np
 
 from config.settings import (
     SwingTraderCreds, SwingTraderConfig,
-    ALPACA_BASE_URL, RISK_PER_TRADE, SHARED_MODEL_PATH
+    ALPACA_BASE_URL, RISK_PER_TRADE, SWING_MODEL_PATH, SHARED_MODEL_PATH
 )
 from src.bots.base_bot import BaseBot
 from src.core.indicators import add_technical_indicators
@@ -27,10 +27,14 @@ class SwingTraderBot(BaseBot):
     """
     
     def __init__(self):
+        # Use swing model if exists, otherwise fall back to shared
+        import os
+        model_path = str(SWING_MODEL_PATH) if os.path.exists(SWING_MODEL_PATH) else str(SHARED_MODEL_PATH)
+        
         super().__init__(
             api_key=SwingTraderCreds.API_KEY,
             api_secret=SwingTraderCreds.API_SECRET,
-            model_path=str(SHARED_MODEL_PATH),
+            model_path=model_path,
             watchlist_file=SwingTraderConfig.WATCHLIST
         )
         
@@ -145,6 +149,18 @@ class SwingTraderBot(BaseBot):
             account = self.api.get_account()
             positions_map = self.get_positions_map()
             
+            # CRITICAL FIX: Only scan for entries near market close (Swing Trading)
+            # Prevent buying on incomplete daily bars which fluctuate wildly.
+            now_et = datetime.now(self.eastern)
+            market_open, market_close = self.get_market_schedule()
+            
+            # Default cutoff: 30 mins before close (usually 3:30 PM ET)
+            cutoff_time = market_close - timedelta(minutes=60) 
+            
+            if now_et < cutoff_time:
+                print(f"⏳ Daily candles incomplete. Walking forward exits only. Entries allowed after {cutoff_time.strftime('%H:%M')} ET.")
+                return
+
             equity = float(account.equity)
             buying_power = float(account.buying_power)
             potential_buys = []

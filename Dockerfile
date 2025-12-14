@@ -19,8 +19,9 @@ COPY my_portfolio.txt /app/
 COPY day_trade_list.txt /app/
 COPY .env /app/
 
-# Set Python path
+# Set Python path and unbuffered output for Docker logs
 ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
 # Default command (overridden by docker-compose)
 CMD ["python", "-m", "src.bots.swing_trader"]

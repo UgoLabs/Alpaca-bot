@@ -10,7 +10,7 @@ import numpy as np
 
 from config.settings import (
     DayTraderCreds, DayTraderConfig,
-    ALPACA_BASE_URL, SHARED_MODEL_PATH
+    ALPACA_BASE_URL, SCALPER_MODEL_PATH, SHARED_MODEL_PATH
 )
 from src.bots.base_bot import BaseBot
 from src.core.indicators import add_technical_indicators
@@ -27,10 +27,14 @@ class DayTraderBot(BaseBot):
     """
     
     def __init__(self):
+        # Use scalper model if exists, otherwise fall back to shared
+        import os
+        model_path = str(SCALPER_MODEL_PATH) if os.path.exists(SCALPER_MODEL_PATH) else str(SHARED_MODEL_PATH)
+        
         super().__init__(
             api_key=DayTraderCreds.API_KEY,
             api_secret=DayTraderCreds.API_SECRET,
-            model_path=str(SHARED_MODEL_PATH),
+            model_path=model_path,
             watchlist_file=DayTraderConfig.WATCHLIST
         )
         
@@ -163,14 +167,21 @@ class DayTraderBot(BaseBot):
                 print(f"\n🎯 Executing {len(top_picks)} buys:")
                 for pick in top_picks:
                     try:
+                        # Calculate prices for Bracket Order
+                        tp_price = round(pick['price'] * (1 + self.config.PROFIT_TARGET_PCT), 2)
+                        sl_price = round(pick['price'] * (1 - self.config.STOP_LOSS_PCT), 2)
+
                         self.api.submit_order(
                             symbol=pick['symbol'],
                             qty=pick['qty'],
                             side='buy',
                             type='market',
-                            time_in_force='day'
+                            time_in_force='day',
+                            order_class='bracket',
+                            take_profit={'limit_price': tp_price},
+                            stop_loss={'stop_price': sl_price}
                         )
-                        print(f"   🟢 {pick['symbol']:6s} BUY {pick['qty']} @ ${pick['price']:.2f}")
+                        print(f"   🟢 {pick['symbol']:6s} BUY {pick['qty']} @ ${pick['price']:.2f} (OCO: ${tp_price:.2f} / ${sl_price:.2f})")
                     except Exception as e:
                         err_msg = str(e).lower()
                         if "insufficient buying power" in err_msg:
@@ -189,6 +200,12 @@ class DayTraderBot(BaseBot):
         
         self.check_exits()
         self.scan_for_entries()
+        
+        # Online Learning: Train on accumulated experiences
+        if self.config.ONLINE_LEARNING and len(self.replay_buffer) >= 32:
+            loss = self.train_on_experiences(batch_size=32)
+            if loss > 0:
+                print(f"🧠 Online Learning: Loss={loss:.4f} (Buffer: {len(self.replay_buffer)})")
         
         print(f"\n{'='*60}")
 

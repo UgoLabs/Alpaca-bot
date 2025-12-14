@@ -34,3 +34,5 @@ models/*.pkl
 # OS specific files
 .DS_Store
 Thumbs.db 
+data/
+data/historical/ 

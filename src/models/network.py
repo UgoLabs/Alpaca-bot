@@ -1,18 +1,36 @@
 """
-GRU-Enhanced Dueling DQN Network
-Processes time-series via GRU, then dueling heads for value/advantage
+Transformer-Based DQN Architecture ('The Titan')
+Uses Multi-Head Self-Attention to capture complex dependencies in price history.
+Optimized for RTX 4070 (Parallel Processing).
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
 from config.settings import TrainingConfig
 
+class PositionalEncoding(nn.Module):
+    """
+    Injects timing information. 
+    Without this, the model wouldn't know that 'Bar 60' is more recent than 'Bar 1'.
+    """
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [Seq_Len, Batch_Size, Embedding_Dim]
+        return x + self.pe[:x.size(0), :]
 
 class NoisyLinear(nn.Module):
-    """Noisy Linear Layer for exploration."""
-    
+    """Noisy Linear Layer for consistent exploration without Epsilon-Greedy."""
     def __init__(self, in_features, out_features, sigma_init=0.5):
         super(NoisyLinear, self).__init__()
         self.in_features = in_features
@@ -55,100 +73,104 @@ class NoisyLinear(nn.Module):
         else:
             return F.linear(x, self.weight_mu, self.bias_mu)
 
-
 class DuelingNetwork(nn.Module):
     """
-    Recurrent Dueling DQN with GRU for time-series processing.
-    
-    Architecture:
-    1. Split input into time-series (window) and static (portfolio) features
-    2. Process time-series through GRU
-    3. Concatenate GRU output with static features
-    4. Dueling heads: Value stream + Advantage stream
+    Main Agent Class.
+    Input: Flattened State Vector
+    Internal: Transformer Encoder
+    Output: Q-Values (Dueling)
     """
-    
-    def __init__(self, state_size, action_size, use_noisy=True):
-        super(DuelingNetwork, self).__init__()
-        self.use_noisy = use_noisy
+    def __init__(self, state_size, action_size, 
+                 d_model=256,      # Larger embedding for RTX 4070
+                 nhead=4,          # 4 Attention Heads
+                 num_layers=2,     # 2 Transformer Blocks
+                 dropout=0.1,
+                 use_noisy=True):
         
-        # Time-series structure (must match utils/state.py)
+        super(DuelingNetwork, self).__init__()
+        
         self.window_size = TrainingConfig.WINDOW_SIZE
         self.num_window_features = TrainingConfig.NUM_WINDOW_FEATURES
         self.time_series_len = self.window_size * self.num_window_features
         self.static_features_len = state_size - self.time_series_len
+        self.use_noisy = use_noisy
         
-        if self.static_features_len < 0:
-            # Fallback to dense network if dimensions don't match
-            self.use_gru = False
-            print(f"Warning: State size {state_size} incompatible with GRU. Using Dense.")
-            self.fc1 = nn.Linear(state_size, 256)
+        # 1. Feature Embedding
+        # Projects the raw input features (e.g., 15 dims) into d_model (256 dims)
+        self.feature_embedding = nn.Linear(self.num_window_features, d_model)
+        
+        # 2. Positional Encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_len=self.window_size)
+        
+        # 3. Transformer
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=512, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        
+        # 4. Static Feature Processing
+        if self.static_features_len > 0:
+            self.static_fc = nn.Linear(self.static_features_len, 64)
+            combined_dim = d_model + 64
         else:
-            self.use_gru = True
+            combined_dim = d_model
             
-            # GRU for time-series
-            self.gru_hidden_size = 128
-            self.gru = nn.GRU(
-                input_size=self.num_window_features,
-                hidden_size=self.gru_hidden_size,
-                num_layers=1,
-                batch_first=True
-            )
-            
-            # First FC layer takes GRU output + static features
-            fc_input_size = self.gru_hidden_size + self.static_features_len
-            self.fc1 = nn.Linear(fc_input_size, 256)
-        
-        # Shared layers
-        self.dropout1 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(256, 256)
-        self.dropout2 = nn.Dropout(0.2)
-        
-        # Dueling streams
+        # 5. Dueling Heads
         if use_noisy:
-            self.value_fc = NoisyLinear(256, 128)
-            self.value = NoisyLinear(128, 1)
-            self.advantage_fc = NoisyLinear(256, 128)
-            self.advantage = NoisyLinear(128, action_size)
+            self.value_fc = NoisyLinear(combined_dim, 256)
+            self.value = NoisyLinear(256, 1)
+            self.advantage_fc = NoisyLinear(combined_dim, 256)
+            self.advantage = NoisyLinear(256, action_size)
         else:
-            self.value_fc = nn.Linear(256, 128)
-            self.value = nn.Linear(128, 1)
-            self.advantage_fc = nn.Linear(256, 128)
-            self.advantage = nn.Linear(128, action_size)
-    
+            self.value_fc = nn.Linear(combined_dim, 256)
+            self.value = nn.Linear(256, 1)
+            self.advantage_fc = nn.Linear(combined_dim, 256)
+            self.advantage = nn.Linear(256, action_size)
+            
     def forward(self, state):
-        if hasattr(self, 'use_gru') and self.use_gru:
-            batch_size = state.size(0)
-            
-            # Split into time-series and static
-            ts_flat = state[:, :self.time_series_len]
-            static_data = state[:, self.time_series_len:]
-            
-            # Reshape for GRU: (batch, sequence, features)
-            ts_reshaped = ts_flat.view(batch_size, self.window_size, self.num_window_features)
-            
-            # GRU forward
-            gru_out, _ = self.gru(ts_reshaped)
-            gru_last = gru_out[:, -1, :]  # Last timestep
-            
-            # Combine with static features
-            x = torch.cat([gru_last, static_data], dim=1)
-            x = F.relu(self.fc1(x))
+        batch_size = state.size(0)
+        
+        # Split State
+        ts_flat = state[:, :self.time_series_len]
+        static_data = state[:, self.time_series_len:]
+        
+        # Reshape TS: (Batch, Window, Features)
+        ts_reshaped = ts_flat.view(batch_size, self.window_size, self.num_window_features)
+        
+        # Transformer Input Format: (Seq, Batch, Feature)
+        x = ts_reshaped.permute(1, 0, 2)
+        
+        # Embed
+        x = self.feature_embedding(x) # (Seq, Batch, d_model)
+        x = self.pos_encoder(x)
+        
+        # Transform
+        x = self.transformer_encoder(x)
+        
+        # Pooling: Use the LAST time step as the "Current State Representation"
+        # Since we use causal masking order (bar 60 comes last), x[-1] contains info from 0..60 refined.
+        final_embedding = x[-1, :, :] # (Batch, d_model)
+        
+        # Combine Static
+        if self.static_features_len > 0:
+            static_out = F.relu(self.static_fc(static_data))
+            combined = torch.cat([final_embedding, static_out], dim=1)
         else:
-            x = F.relu(self.fc1(state))
-        
-        x = self.dropout1(x)
-        x = F.relu(self.fc2(x))
-        x = self.dropout2(x)
-        
-        # Dueling: V(s) + A(s,a) - mean(A)
-        val = F.relu(self.value_fc(x))
-        val = self.value(val)
-        
-        adv = F.relu(self.advantage_fc(x))
-        adv = self.advantage(adv)
-        
+            combined = final_embedding
+            
+        # Dueling
+        if self.use_noisy:
+            # NoisyNet doesn't use dropout usually
+            val = F.relu(self.value_fc(combined))
+            val = self.value(val)
+            adv = F.relu(self.advantage_fc(combined))
+            adv = self.advantage(adv)
+        else:
+            val = F.relu(self.value_fc(combined))
+            val = self.value(val)
+            adv = F.relu(self.advantage_fc(combined))
+            adv = self.advantage(adv)
+            
         return val + (adv - adv.mean(dim=1, keepdim=True))
-    
+        
     def reset_noise(self):
         if self.use_noisy:
             self.value_fc.reset_noise()

@@ -28,8 +28,8 @@ class DuelingDQN:
             learning_rate = TrainingConfig.LEARNING_RATE
         
         # Networks
-        self.model = DuelingNetwork(state_size, action_size, use_noisy).to(self.device)
-        self.target_model = DuelingNetwork(state_size, action_size, use_noisy).to(self.device)
+        self.model = DuelingNetwork(state_size, action_size, use_noisy=use_noisy).to(self.device)
+        self.target_model = DuelingNetwork(state_size, action_size, use_noisy=use_noisy).to(self.device)
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
         
