@@ -15,9 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY config/ /app/config/
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
-COPY my_portfolio.txt /app/
-COPY day_trade_list.txt /app/
-COPY .env /app/
 
 # Set Python path and unbuffered output for Docker logs
 ENV PYTHONPATH=/app

@@ -4,6 +4,7 @@ Leverages the 3.4TB storage for instant training access later.
 """
 import os
 import sys
+import argparse
 import pandas as pd
 from datetime import datetime, timedelta
 import alpaca_trade_api as tradeapi
@@ -18,17 +19,25 @@ from config.settings import SwingTraderCreds, ALPACA_BASE_URL
 
 # Configuration
 DATA_DIR = "data/historical"
-TIMEFRAME = "1Min"
+# TIMEFRAME = "1Min" # Now handled by argparse
 START_DATE = "2020-01-01"  # 5+ Years of data
-SYMBOLS_FILE = "my_portfolio.txt"
+SYMBOLS_FILE = "config/watchlists/my_portfolio.txt"
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
 def download_data():
+    # Parse Arguments
+    parser = argparse.ArgumentParser(description='Download Historical Data')
+    parser.add_argument('--timeframe', type=str, default='1Min', help='Timeframe (1Min, 5Min, 15Min, 1Hour, 1Day)')
+    args = parser.parse_args()
+    
+    TIMEFRAME = args.timeframe
+    
     print(f"🚀 Initializing Massive Data Download Strategy")
     print(f"📂 Target: {os.path.abspath(DATA_DIR)}")
+    print(f"⏱️  Timeframe: {TIMEFRAME}")
     print(f"📅 Range: {START_DATE} to Now")
     
     ensure_dir(DATA_DIR)

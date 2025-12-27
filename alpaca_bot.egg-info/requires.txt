@@ -9,4 +9,3 @@ yfinance
 pytz
 transformers
 tokenizers
-tensorboard

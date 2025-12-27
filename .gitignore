@@ -2,6 +2,7 @@
 .env
 
 # Python virtual environment
+.venv/
 tf-gpu-env/
 venv/
 env/
@@ -13,14 +14,18 @@ __pycache__/
 
 # Log files
 *.log
+logs/
 
-# Model files (these can be large)
-models/*.h5
-models/*.weights
-models/*.model
+# Model files (large binary files)
 models/*.pth
 models/*.pt
 models/*.pkl
+models/*.h5
+
+# Data cache (large CSV files)
+data_cache/
+data/
+data/historical/
 
 # IDE specific files
 .vscode/
@@ -30,9 +35,13 @@ models/*.pkl
 *.swp
 *.swo
 *~
+temp_*.txt
+*.zip
 
 # OS specific files
 .DS_Store
-Thumbs.db 
-data/
-data/historical/ 
+Thumbs.db
+
+# Build artifacts
+.mypy_cache/
+.agent/ 

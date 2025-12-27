@@ -1,0 +1,15 @@
+[MASTER]
+ignore=.venv,alpaca-mcp-server-main,data,data_cache,logs,models
+
+[MESSAGES CONTROL]
+# Keep only high-signal lint. We don't want style noise.
+disable=
+    C0301,  # line-too-long
+    C0114,  # missing-module-docstring
+    C0115,  # missing-class-docstring
+    C0116,  # missing-function-docstring
+    W0718,  # broad-exception-caught
+    W0603   # global-statement
+
+[FORMAT]
+max-line-length=120

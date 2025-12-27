@@ -76,8 +76,49 @@ def add_technical_indicators(df):
         try: df.columns = df.columns.get_level_values(0)
         except: pass
     df = df.loc[:, ~df.columns.duplicated()]
-    if 'Close' in df.columns: df['Close'] = df['Close'].replace(0, np.nan).ffill()
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].replace(0, np.nan).ffill()
+    
+    # Ensure numeric and fill NaNs robustly
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    if 'Close' in df.columns: df['Close'] = df['Close'].ffill().bfill()
+    if 'High' in df.columns: df['High'] = df['High'].fillna(df['Close'])
+    if 'Low' in df.columns: df['Low'] = df['Low'].fillna(df['Close'])
+    if 'Open' in df.columns: df['Open'] = df['Open'].fillna(df['Close'])
+    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
+
+def calculate_atr(high, low, close, window=14):
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=window).mean()
+    return atr
+
+def add_technical_indicators(df):
+    """
+    Adds comprehensive technical indicators to the DataFrame.
+    Expects columns: 'Open', 'High', 'Low', 'Close', 'Volume'
+    """
+    df = df.copy()
+    
+    # Handle MultiIndex and basic cleanup
+    if isinstance(df.columns, pd.MultiIndex):
+        try: df.columns = df.columns.get_level_values(0)
+        except: pass
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # Ensure numeric and fill NaNs robustly
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    if 'Close' in df.columns: df['Close'] = df['Close'].ffill().bfill()
+    if 'High' in df.columns: df['High'] = df['High'].fillna(df['Close'])
+    if 'Low' in df.columns: df['Low'] = df['Low'].fillna(df['Close'])
+    if 'Open' in df.columns: df['Open'] = df['Open'].fillna(df['Close'])
+    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
 
     # Get Series
     close = df['Close'] if 'Close' in df.columns else pd.Series(np.zeros(len(df)), index=df.index)
@@ -89,6 +130,13 @@ def add_technical_indicators(df):
     df['sma_10'] = close.rolling(window=10).mean().fillna(0)
     df['sma_20'] = close.rolling(window=20).mean().fillna(0)
     df['sma_50'] = close.rolling(window=50).mean().fillna(0)
+    
+    # 2. VOLATILITY
+    df['atr'] = calculate_atr(high, low, close, window=14).fillna(0)
+    sma, upper, lower = calculate_bollinger_bands(close, window=20)
+    df['bb_width'] = ((upper - lower) / sma).replace([np.inf, -np.inf], 0).fillna(0)
+    df['bb_upper'] = upper.fillna(0)
+    df['bb_lower'] = lower.fillna(0)
     df['sma_200'] = close.rolling(window=200).mean().fillna(0)
     
     df['ema_12'] = close.ewm(span=12, adjust=False).mean().fillna(0)
@@ -143,8 +191,8 @@ def add_technical_indicators(df):
     raw_money_flow = typical_price * volume
     pos_flow = np.where(typical_price > typical_price.shift(1), raw_money_flow, 0)
     neg_flow = np.where(typical_price < typical_price.shift(1), raw_money_flow, 0)
-    pos_mf = pd.Series(pos_flow).rolling(14).sum()
-    neg_mf = pd.Series(neg_flow).rolling(14).sum()
+    pos_mf = pd.Series(pos_flow, index=df.index).rolling(14).sum()
+    neg_mf = pd.Series(neg_flow, index=df.index).rolling(14).sum()
     mfr = pos_mf / neg_mf.replace(0, 1)
     df['mfi'] = (100 - (100 / (1 + mfr))).fillna(50)
 
@@ -172,129 +220,6 @@ def add_technical_indicators(df):
     df['trend_strength'] = np.where(df['adx'] > 25, 1, 0)
 
     return df
-
-def normalize_state(state_df, current_step, window_size):
-    """
-    Extracts and normalizes the window of data for the agent.
-    Returns a comprehensive feature vector.
-    """
-    # Get the window of data
-    start_idx = max(0, current_step - window_size + 1)
-    end_idx = current_step + 1
-    window = state_df.iloc[start_idx:end_idx].copy()
-    
-    # Pad if window is too small
-    if len(window) < window_size:
-        padding = pd.DataFrame(
-            np.zeros((window_size - len(window), len(window.columns))),
-            columns=window.columns
-        )
-        window = pd.concat([padding, window], ignore_index=True)
-    
-    # Get baseline price for normalization
-    baseline_price = window['Close'].iloc[0]
-    if baseline_price == 0:
-        baseline_price = 1.0
-    
-    # =========================================================================
-    # FEATURE SET 1: Price Action (Window of data)
-    # =========================================================================
-    # Normalized price (relative to window start)
-    norm_close = (window['Close'].values / baseline_price) - 1.0
-    
-    # =========================================================================
-    # FEATURE SET 2: Momentum Indicators
-    # =========================================================================
-    norm_rsi = window['rsi'].values / 100.0  # 0-1 scale
-    norm_stoch_k = window['stoch_k'].values / 100.0  # 0-1 scale
-    norm_stoch_d = window['stoch_d'].values / 100.0  # 0-1 scale
-    norm_williams = (window['williams_r'].values + 100) / 100.0  # -100 to 0 -> 0 to 1
-    norm_mfi = window['mfi'].values / 100.0  # 0-1 scale
-    
-    # =========================================================================
-    # FEATURE SET 3: Trend Indicators
-    # =========================================================================
-    # MACD relative to price
-    norm_macd = window['macd'].values / window['Close'].values
-    norm_macd_signal = window['macd_signal'].values / window['Close'].values
-    norm_macd_diff = window['macd_diff'].values / window['Close'].values
-    
-    # ADX (already 0-100, normalize to 0-1)
-    norm_adx = window['adx'].values / 100.0
-    
-    # Price vs SMAs (already percentage)
-    norm_price_sma20 = np.clip(window['price_vs_sma20'].values, -0.5, 0.5)
-    norm_price_sma50 = np.clip(window['price_vs_sma50'].values, -0.5, 0.5)
-    
-    # SMA slopes (clip extreme values)
-    norm_sma20_slope = np.clip(window['sma20_slope'].values * 10, -1, 1)
-    norm_sma50_slope = np.clip(window['sma50_slope'].values * 10, -1, 1)
-    
-    # =========================================================================
-    # FEATURE SET 4: Volatility
-    # =========================================================================
-    # Bollinger %B (already normalized ~0-1, but can exceed)
-    norm_bb_pband = np.clip(window['bb_pband'].values, -0.5, 1.5)
-    
-    # ATR relative to price
-    norm_atr = window['atr'].values / window['Close'].values
-    
-    # Volatility regime
-    norm_vol_regime = np.clip(window['volatility_regime'].values * 20, 0, 2)
-    
-    # =========================================================================
-    # FEATURE SET 5: Volume
-    # =========================================================================
-    # Volume ratio (relative to 20-day average)
-    norm_volume_ratio = np.clip(window['volume_ratio'].values, 0, 5) / 5.0
-    
-    # =========================================================================
-    # FEATURE SET 6: Market Regime (Single Values - Latest)
-    # =========================================================================
-    latest = window.iloc[-1]
-    regime_features = np.array([
-        latest['regime'],                    # -1, 0, 1
-        latest['trend_strength'],            # 0 or 1
-        latest['sma_cross'],                 # -1 or 1
-        np.clip(latest['momentum_5d'] * 10, -1, 1),   # 5-day momentum
-        np.clip(latest['momentum_10d'] * 5, -1, 1),   # 10-day momentum
-        np.clip(latest['momentum_20d'] * 3, -1, 1),   # 20-day momentum
-    ])
-    
-    # =========================================================================
-    # COMBINE ALL FEATURES
-    # =========================================================================
-    # Window features (each is window_size length)
-    window_features = np.column_stack((
-        norm_close,           # Price action
-        norm_rsi,             # RSI
-        norm_stoch_k,         # Stochastic %K
-        norm_macd_diff,       # MACD histogram
-        norm_bb_pband,        # Bollinger %B
-        norm_atr,             # ATR ratio
-        norm_volume_ratio,    # Volume ratio
-        norm_adx,             # Trend strength
-        norm_price_sma20,     # Price vs SMA20
-        norm_price_sma50,     # Price vs SMA50
-        norm_sma20_slope,     # SMA20 direction
-    ))
-    
-    # Flatten window features and add regime features
-    features = np.concatenate([
-        window_features.flatten(),
-        regime_features
-    ])
-    
-    return features.astype(np.float32)
-
-
-def get_state_size(window_size):
-    """Calculate the total state size for the agent."""
-    num_window_features = 11  # Features per timestep
-    num_regime_features = 6   # Single-value regime features
-    num_portfolio_features = 5  # Added in environment
-    
-    return (window_size * num_window_features) + num_regime_features + num_portfolio_features
 
 
 def detect_market_regime(df, current_step):

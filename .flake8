@@ -1,0 +1,25 @@
+[flake8]
+max-line-length = 120
+# Keep lint focused on code (not data/artifacts/submodules).
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    alpaca-mcp-server-main,
+    data,
+    data_cache,
+    logs,
+    models
+
+# This repo isn't written to strict pycodestyle; reduce noise.
+extend-ignore =
+    E203,
+    W503
+
+per-file-ignores =
+    # Uses sys.path injection for script entrypoints.
+    scripts/train_gpu.py:E402
+    scripts/train_gpu_swing.py:E402
+    scripts/backtest.py:E402
+    scripts/portfolio_backtest.py:E402
+    scripts/check_checkpoint_compat.py:E501
