@@ -45,3 +45,9 @@ Thumbs.db
 # Build artifacts
 .mypy_cache/
 .agent/ 
+# Archives and artifacts
+archive/
+plots/
+*.png
+models/*.json
+models/gen5_deployed_backup/

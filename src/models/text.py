@@ -26,6 +26,14 @@ class TextHead(nn.Module):
         # input_ids: (Batch, Seq_Len)
         # attention_mask: (Batch, Seq_Len)
         
+        # Optimization: Bypass BERT if inputs are dummy (all zeros)
+        # This speeds up training significantly on CPU/GPU when text is not used
+        if (input_ids == 0).all():
+             batch_size = input_ids.shape[0]
+             # Return valid zeros (passed through relu is 0). 
+             # Use a cached zero tensor to avoid allocation if possible, but new is strict safe.
+             return torch.zeros((batch_size, self.fc.out_features), device=input_ids.device)
+
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         
         # Take the [CLS] token embedding (first token) as the sentence summary

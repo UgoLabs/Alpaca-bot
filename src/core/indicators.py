@@ -212,12 +212,41 @@ def add_technical_indicators(df):
     df['momentum_20d'] = close.pct_change(periods=20).fillna(0)
     df['return_volatility'] = close.pct_change().rolling(window=20).std().fillna(0)
 
-    # 6. MARKET REGIME
+    # 6. MARKET REGIME DETECTION (Enhanced for Bull/Bear)
+    # Basic Regime: +1 = Bull, -1 = Bear, 0 = Neutral
     df['regime'] = np.where(
         (close > df['sma_50']) & (df['sma_50'] > df['sma_200']), 1,
         np.where((close < df['sma_50']) & (df['sma_50'] < df['sma_200']), -1, 0)
     )
     df['trend_strength'] = np.where(df['adx'] > 25, 1, 0)
+    
+    # Drawdown from rolling high (bear market signal)
+    rolling_high = close.rolling(window=50).max()
+    df['drawdown_pct'] = ((close - rolling_high) / rolling_high.replace(0, 1)).fillna(0)
+    
+    # Bear market flag: drawdown > 10% from recent high
+    df['bear_flag'] = np.where(df['drawdown_pct'] < -0.10, 1, 0)
+    
+    # Volatility regime: high vol = uncertainty (often bear)
+    vol_20 = close.pct_change().rolling(window=20).std().fillna(0)
+    vol_60 = close.pct_change().rolling(window=60).std().fillna(0)
+    df['vol_expansion'] = np.where(vol_20 > vol_60 * 1.5, 1, 0)  # Vol spike
+    
+    # Momentum regime: negative momentum = bear
+    mom_20 = close.pct_change(periods=20).fillna(0)
+    mom_60 = close.pct_change(periods=60).fillna(0)
+    df['momentum_regime'] = np.where(
+        (mom_20 > 0) & (mom_60 > 0), 1,  # Bull momentum
+        np.where((mom_20 < 0) & (mom_60 < 0), -1, 0)  # Bear momentum
+    )
+    
+    # Combined regime score: -3 to +3
+    df['regime_score'] = (
+        df['regime'] + 
+        df['momentum_regime'] - 
+        df['bear_flag'] - 
+        df['vol_expansion']
+    ).clip(-3, 3)
 
     return df
 

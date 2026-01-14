@@ -5,6 +5,7 @@ import yfinance as yf
 from tqdm import tqdm
 import sys
 import os
+import argparse
 
 # Add project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,7 +86,7 @@ def fetch_and_process_test_data(symbols):
         
     return torch.FloatTensor(np.array(data_list)), torch.FloatTensor(np.array(price_list))
 
-def validate():
+def validate(model_prefix: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🧪 Starting Validation on {device}...")
     
@@ -109,8 +110,8 @@ def validate():
         device=device
     )
     
-    # 4. Load BEST Model
-    model_path = "models/swing_best"
+    # 4. Load Model
+    model_path = model_prefix
     print(f"📂 Loading model from {model_path}...")
     try:
         agent.load(model_path)
@@ -133,15 +134,14 @@ def validate():
     # Tracking
     portfolio_values = []
     
+    # Force greedy for validation (batch_act uses epsilon)
+    for sub in agent.agents:
+        sub.epsilon = 0.0
+        sub.policy_net.eval()
+
     for _ in tqdm(range(steps)):
-        # Act deterministically (eval_mode=True)
-        actions = agent.batch_act(state, dummy_text_ids, dummy_text_mask) # Note: batch_act uses epsilon, need to force greedy
-        
-        # Force greedy for validation
-        # We can manually set epsilon to 0 temporarily
-        for sub in agent.agents:
-            sub.epsilon = 0.0
-            
+        actions = agent.batch_act(state, dummy_text_ids, dummy_text_mask)
+
         # Step
         next_state, rewards, dones, infos = env.step(actions)
         
@@ -159,4 +159,12 @@ def validate():
         print("\n⚠️ WARNING: Model lost money on new data. Likely overfitting.")
 
 if __name__ == "__main__":
-    validate()
+    parser = argparse.ArgumentParser(description="Validate generalization on unseen symbols")
+    parser.add_argument(
+        "model_prefix",
+        nargs="?",
+        default="models/swing_best_phase2",
+        help="Model prefix path (no _balanced suffix). Default: models/swing_best_phase2",
+    )
+    args = parser.parse_args()
+    validate(str(args.model_prefix))

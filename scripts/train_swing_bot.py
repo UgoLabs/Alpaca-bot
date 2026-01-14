@@ -1,6 +1,7 @@
 import sys
 import os
 import glob
+import argparse
 import torch
 import numpy as np
 import pandas as pd
@@ -120,12 +121,18 @@ def load_swing_data():
     
     return data_tensor, price_tensor
 
-def train():
+def train(
+    max_steps: int | None = None,
+    episodes: int = 200,
+    train_every: int = 32,
+    store_every: int = 32,
+    log_dir: str = "logs/runs/swing_experiment_1",
+):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🚀 Starting Swing Bot Training on {device}...")
     
     # Initialize TensorBoard Writer
-    writer = SummaryWriter(log_dir="logs/runs/swing_experiment_1")
+    writer = SummaryWriter(log_dir=log_dir)
     
     # 1. Load Data
     data, prices = load_swing_data()
@@ -225,23 +232,31 @@ def train():
             sub_agent.epsilon_decay = epsilon_decay
 
     # 4. Training Loop
-    EPISODES = 200
+    EPISODES = int(episodes)
     
     # Dummy Text Data
     seq_len = 64
     dummy_text_ids = torch.zeros((env.num_envs, seq_len), dtype=torch.long).to(device)
     dummy_text_mask = torch.ones((env.num_envs, seq_len), dtype=torch.long).to(device)
+    # Cache CPU numpy versions once (avoid per-step GPU->CPU copies)
+    dummy_text_ids_np = dummy_text_ids[0].detach().cpu().numpy()
+    dummy_text_mask_np = dummy_text_mask[0].detach().cpu().numpy()
     
     # Track Best Reward
     # Set to 134.0 (Previous High) so we don't overwrite with lower scores
     best_reward = 134.0 
     print(f"🏆 Best Reward Baseline set to {best_reward}. Will only save if exceeded.")
 
+    train_every_n = max(1, int(train_every))
+    store_every_n = max(1, int(store_every))
+
     for episode in range(start_episode, EPISODES):
         state = env.reset()  # (Envs, Window, Features)
         total_reward = 0
         
-        steps_per_episode = env.total_steps
+        steps_per_episode = int(env.total_steps)
+        if max_steps is not None:
+            steps_per_episode = min(steps_per_episode, int(max_steps))
         
         pbar = tqdm(total=steps_per_episode, desc=f"Episode {episode+1}/{EPISODES}")
         
@@ -252,19 +267,22 @@ def train():
             # Step Env
             next_state, rewards, dones, _ = env.step(actions)
             
-            # Store Experience & Train
-            state_cpu = state.cpu().numpy()
-            next_state_cpu = next_state.cpu().numpy()
-            actions_cpu = actions.cpu().numpy()
-            rewards_cpu = rewards.cpu().numpy()
-            dones_cpu = dones.cpu().numpy()
-            
-            for i in range(env.num_envs):
-                s = (state_cpu[i], dummy_text_ids[i].cpu().numpy(), dummy_text_mask[i].cpu().numpy())
-                ns = (next_state_cpu[i], dummy_text_ids[i].cpu().numpy(), dummy_text_mask[i].cpu().numpy())
-                agent.remember(s, actions_cpu[i], rewards_cpu[i], ns, dones_cpu[i])
-            
-            losses = agent.train_step()
+            # Store Experience (optionally subsampled)
+            if (step_idx % store_every_n) == 0:
+                state_cpu = state.detach().cpu().numpy()
+                next_state_cpu = next_state.detach().cpu().numpy()
+                actions_cpu = actions.detach().cpu().numpy()
+                rewards_cpu = rewards.detach().cpu().numpy()
+                dones_cpu = dones.detach().cpu().numpy()
+
+                for i in range(env.num_envs):
+                    s = (state_cpu[i], dummy_text_ids_np, dummy_text_mask_np)
+                    ns = (next_state_cpu[i], dummy_text_ids_np, dummy_text_mask_np)
+                    agent.remember(s, actions_cpu[i], rewards_cpu[i], ns, dones_cpu[i])
+
+            losses = None
+            if (step_idx % train_every_n) == 0:
+                losses = agent.train_step()
             
             global_step = episode * steps_per_episode + step_idx
             if losses:
@@ -297,4 +315,19 @@ def train():
     writer.close()
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Train swing ensemble agent")
+    parser.add_argument("--max-steps", type=int, default=0, help="Optional cap on steps per episode (0 = full)")
+    parser.add_argument("--episodes", type=int, default=200, help="Number of training episodes")
+    parser.add_argument("--train-every", type=int, default=32, help="Run gradient update every N env steps")
+    parser.add_argument("--store-every", type=int, default=32, help="Store replay transition every N env steps")
+    parser.add_argument("--log-dir", type=str, default="logs/runs/swing_experiment_1", help="TensorBoard log directory")
+    args = parser.parse_args()
+
+    max_steps = None if int(args.max_steps) <= 0 else int(args.max_steps)
+    train(
+        max_steps=max_steps,
+        episodes=int(args.episodes),
+        train_every=int(args.train_every),
+        store_every=int(args.store_every),
+        log_dir=str(args.log_dir),
+    )

@@ -8,7 +8,7 @@ class VectorizedTradingEnv:
     Simulates hundreds of tickers simultaneously using PyTorch Tensors.
     Eliminates CPU-GPU data transfer bottleneck.
     """
-    def __init__(self, data_tensor, price_tensor, device="cuda"):
+    def __init__(self, data_tensor, price_tensor, device="cuda", position_pct: float = 1.0):
         """
         data_tensor: (Num_Envs, Total_Time, Features) - Normalized
         price_tensor: (Num_Envs, Total_Time) - Raw Prices
@@ -20,6 +20,18 @@ class VectorizedTradingEnv:
         
         self.window_size = TrainingConfig.WINDOW_SIZE
         self.initial_balance = 10000.0
+
+        # Cached indices/tensors to avoid per-step reallocations
+        self._row_indices = torch.arange(self.num_envs, device=device)
+        self._window_offsets = torch.arange(self.window_size, device=device).view(1, -1)
+
+        # Position sizing: fraction of available cash to deploy on BUY.
+        # Default 1.0 preserves existing all-in behavior used during training.
+        try:
+            self.position_pct = float(position_pct)
+        except Exception:
+            self.position_pct = 1.0
+        self.position_pct = max(0.0, min(1.0, self.position_pct))
 
         # Execution realism (configurable; defaults keep existing behavior)
         # BPS = basis points, e.g. 10 bps = 0.10%
@@ -41,6 +53,26 @@ class VectorizedTradingEnv:
         # Equity tracking (for PnL-based reward)
         self.prev_equity = torch.full((self.num_envs,), self.initial_balance, device=device)
         
+        # Exit reward shaping parameters
+        self.exit_profit_bonus = float(getattr(TrainingConfig, 'EXIT_PROFIT_BONUS', 0.001))
+        self.holding_loss_penalty = float(getattr(TrainingConfig, 'HOLDING_LOSS_PENALTY', 0.0001))
+        self.loss_threshold_pct = float(getattr(TrainingConfig, 'LOSS_THRESHOLD_PCT', 0.02))
+        
+        # Track how long we've been in a position (for holding penalty)
+        self.steps_in_position = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+
+        # ===== TRAILING STOP & PROFIT-TAKE (applied during training) =====
+        # DISABLED for training - let the model learn exit timing itself
+        # These can be enabled in backtest/production for risk management
+        self.use_trailing_stop = bool(getattr(TrainingConfig, 'USE_TRAILING_STOP', False))
+        self.trailing_stop_atr_mult = float(getattr(TrainingConfig, 'TRAILING_STOP_ATR_MULT', 3.0))
+        self.use_profit_take = bool(getattr(TrainingConfig, 'USE_PROFIT_TAKE', False))
+        self.profit_take_atr_mult = float(getattr(TrainingConfig, 'PROFIT_TAKE_ATR_MULT', 4.0))
+        # Track highest price since entry (for trailing stop)
+        self.high_since_entry = torch.zeros(self.num_envs, device=device)
+        # Simple ATR approximation: rolling volatility (we'll compute per-step)
+        self.atr_window = int(getattr(TrainingConfig, 'ATR_WINDOW', 14))
+        
         # Reset all
         self.reset()
         
@@ -58,32 +90,20 @@ class VectorizedTradingEnv:
         self.in_position.zero_()
         self.total_reward.zero_()
         self.prev_equity.fill_(self.initial_balance)
+        self.steps_in_position.zero_()
+        self.high_since_entry.zero_()
         
         return self._get_observation()
         
     def _get_observation(self):
-        # Extract window for each env efficiently
-        # This is tricky in PyTorch without a loop. We use gather or specialized unfolding.
-        # Simple Loop is surprisingly fast on GPU if batch is large, but unfold is better.
-        
-        # Shape: (Num_Envs, Window, Features)
-        # We construct indices: [current_step-window ... current_step]
-        
-        # Fastest way: Loop for window size (small constant 60) vs Loop for Envs (large 258)
-        # We loop window size.
-        
-        frames = []
-        for i in range(self.window_size):
-            # t = current_step - window + i
-            indices = self.current_step - self.window_size + i
-            # self.data shape: (Envs, Time, Feat)
-            # data[env_idx, indices[env_idx], :]
-            
-            # We use advanced indexing
-            row_indices = torch.arange(self.num_envs, device=self.device)
-            frames.append(self.data[row_indices, indices, :])
-            
-        return torch.stack(frames, dim=1) # (Envs, Window, Features)
+        # Vectorized gather:
+        # time_idx: (Envs, Window) where each row is [t-window, ..., t-1]
+        time_idx = (self.current_step.view(-1, 1) - self.window_size) + self._window_offsets
+        time_idx = torch.clamp(time_idx, min=0, max=self.total_steps - 1)
+
+        # Gather along time dimension (dim=1)
+        gather_idx = time_idx.unsqueeze(2).expand(-1, -1, self.num_features)
+        return self.data.gather(dim=1, index=gather_idx)
         
     def step(self, actions):
         """
@@ -95,12 +115,11 @@ class VectorizedTradingEnv:
         - Removes shaped bonuses/penalties that can be reward-hacked
         """
         # 1. Get Current Prices from RAW Prices
-        row_indices = torch.arange(self.num_envs, device=self.device)
-        current_prices = self.prices[row_indices, self.current_step]
+        current_prices = self.prices[self._row_indices, self.current_step]
 
         # Next-step prices for mark-to-market reward (equity at t+1)
         next_step = torch.clamp(self.current_step + 1, max=self.total_steps - 1)
-        next_prices = self.prices[row_indices, next_step]
+        next_prices = self.prices[self._row_indices, next_step]
         
         # 2. Logic masking & action sanitization
         rewards = torch.zeros(self.num_envs, device=self.device)
@@ -110,13 +129,40 @@ class VectorizedTradingEnv:
         invalid_sell_flat = (actions == 2) & (~self.in_position)
         invalid_buy_in_pos = (actions == 1) & (self.in_position)
 
+        # ===== TRAILING STOP & PROFIT-TAKE: Force SELL if triggered =====
+        forced_sell_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.in_position.any() and (self.use_trailing_stop or self.use_profit_take):
+            # Update high_since_entry for trailing stop
+            self.high_since_entry[self.in_position] = torch.maximum(
+                self.high_since_entry[self.in_position],
+                current_prices[self.in_position]
+            )
+            # Compute simple ATR approximation: use price volatility over recent window
+            # For speed, approximate ATR as % of current price * fixed factor
+            approx_atr = current_prices * 0.02  # ~2% of price as ATR proxy (conservative)
+            
+            if self.use_trailing_stop:
+                # Trailing stop: price < high_since_entry - ATR * mult
+                stop_price = self.high_since_entry - (approx_atr * self.trailing_stop_atr_mult)
+                stop_triggered = self.in_position & (current_prices < stop_price)
+                forced_sell_mask = forced_sell_mask | stop_triggered
+            
+            if self.use_profit_take:
+                # Profit take: price > entry + ATR * mult
+                profit_target = self.entry_price + (approx_atr * self.profit_take_atr_mult)
+                profit_triggered = self.in_position & (current_prices > profit_target)
+                forced_sell_mask = forced_sell_mask | profit_triggered
+
         # Action masking (setup change): force invalid actions to HOLD.
         # This prevents policy collapse into meaningless no-ops.
         # We still apply an explicit penalty below using the *original* invalid masks.
-        effective_actions = actions
+        effective_actions = actions.clone()
         if invalid_sell_flat.any() or invalid_buy_in_pos.any():
-            effective_actions = actions.clone()
             effective_actions[invalid_sell_flat | invalid_buy_in_pos] = 0
+        
+        # Override action to SELL for forced exits (trailing stop or profit take)
+        if forced_sell_mask.any():
+            effective_actions[forced_sell_mask] = 2  # Force SELL action
 
         # Equity at time t (before action). When flat, shares=0 so equity==balance.
         equity_t = self.balance + self.shares * current_prices
@@ -131,16 +177,21 @@ class VectorizedTradingEnv:
             else:
                 self.entry_price[buy_mask] = current_prices[buy_mask]
 
-            # Full notional position sizing (all-in)
+            # Position sizing (default all-in). Keep the undeployed cash in balance.
             safe_entry = torch.clamp(self.entry_price[buy_mask], min=0.01)
-            self.shares[buy_mask] = self.balance[buy_mask] / safe_entry
-            self.balance[buy_mask] = 0.0
+            deploy_cash = self.balance[buy_mask] * self.position_pct
+            self.shares[buy_mask] = deploy_cash / safe_entry
+            self.balance[buy_mask] = self.balance[buy_mask] - deploy_cash
 
             self.in_position[buy_mask] = True
             self.trades[buy_mask] += 1
             
+            # Initialize high_since_entry for trailing stop tracking
+            self.high_since_entry[buy_mask] = current_prices[buy_mask]
+            
         # SELL Logic (Action 2) & In Position
         sell_mask = (effective_actions == 2) & (self.in_position)
+        sell_pnl_pct = torch.zeros(self.num_envs, device=self.device)  # Track PnL for reward shaping
         if sell_mask.any():
             # Apply costs on exit by reducing effective exit price.
             if self._total_cost_rate > 0:
@@ -148,17 +199,43 @@ class VectorizedTradingEnv:
             else:
                 exit_price = current_prices[sell_mask]
 
-            # Close position into cash
-            self.balance[sell_mask] = self.shares[sell_mask] * exit_price
+            # Calculate profit/loss percentage before closing
+            entry_prices_sell = self.entry_price[sell_mask]
+            sell_pnl_pct[sell_mask] = (exit_price - entry_prices_sell) / torch.clamp(entry_prices_sell, min=0.01)
+            
+            # Close position into cash (add proceeds to any remaining balance)
+            self.balance[sell_mask] = self.balance[sell_mask] + (self.shares[sell_mask] * exit_price)
+            
             self.shares[sell_mask] = 0.0
             self.entry_price[sell_mask] = 0.0
             self.in_position[sell_mask] = False
+            self.steps_in_position[sell_mask] = 0
+            self.high_since_entry[sell_mask] = 0.0  # Reset trailing stop tracker
             
+        # INCREMENT STEPS IN POSITION for those still holding
+        self.steps_in_position[self.in_position] += 1
+        
         # Reward is equity log-return from t -> t+1 (mark-to-market on next_prices)
         equity_tp1 = self.balance + self.shares * next_prices
         safe_equity_t = torch.clamp(equity_t, min=1e-6)
         reward_lr = torch.log(torch.clamp(equity_tp1 / safe_equity_t, min=1e-6))
         rewards = reward_lr
+        
+        # EXIT REWARD SHAPING: Bonus for profitable exits (applied AFTER base reward)
+        profitable_exits = sell_mask & (sell_pnl_pct > 0)
+        if profitable_exits.any():
+            profit_bonus = torch.clamp(sell_pnl_pct[profitable_exits], max=0.10) * self.exit_profit_bonus * 10
+            rewards[profitable_exits] += profit_bonus
+        
+        # HOLDING LOSS PENALTY: Penalize holding losing positions
+        if self.in_position.any():
+            unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
+            losing_positions = self.in_position & (unrealized_pnl_pct < -self.loss_threshold_pct)
+            if losing_positions.any():
+                # Penalty scales with how long we've been holding the loser
+                hold_time_factor = torch.clamp(self.steps_in_position[losing_positions].float() / 10.0, max=5.0)
+                loss_penalty = self.holding_loss_penalty * hold_time_factor
+                rewards[losing_positions] -= loss_penalty
 
         # Small penalty for invalid actions (keeps gradients pointing away from nonsense)
         # Adjusted to -0.000001 (0.1 bps) to minimize impact on PnL visibility while still discouraging invalid moves.
@@ -184,9 +261,11 @@ class VectorizedTradingEnv:
             self.shares[dones] = 0.0
             self.entry_price[dones] = 0.0
             self.in_position[dones] = False
+            self.steps_in_position[dones] = 0
+            self.high_since_entry[dones] = 0.0  # Reset trailing stop tracker
             # We don't reset total_reward here to track episode, but for RL training loop we just need 'done' flag
             
         next_obs = self._get_observation()
         
-        return next_obs, rewards, dones, {}
+        return next_obs, rewards, dones, {'equity': equity_tp1, 'action': effective_actions, 'entry_price': self.entry_price, 'shares': self.shares}
 

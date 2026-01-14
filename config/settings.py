@@ -70,25 +70,29 @@ class SwingTraderConfig:
     SCAN_INTERVAL_MINUTES = int(os.getenv("SWING_SCAN_INTERVAL_MINUTES", "5"))
     USE_WEBSOCKET = False
     WATCHLIST = "my_portfolio.txt"
-    STOP_ATR_MULT = 2.5
-    TRAILING_ATR_MULT = 3.0
-    PROFIT_ATR_MULT = 4.0
+    # Tuned exits (Phase 2): mandatory ATR trailing stop + ATR profit-take
+    # Increased to 6.0 for Episode 330 "Aggressive Update" Model (Catastrophe Insurance only)
+    STOP_ATR_MULT = 6.0
+    TRAILING_ATR_MULT = 6.0
+    PROFIT_ATR_MULT = 3.0
     LIQUIDATE_EOD = False
     ONLINE_LEARNING = True
     EXPLORATION_EPSILON = 0.03  # 3% exploration for swing trades
+    DATA_FEED = 'sip'  # 15-min delayed data (if no paid sub)
 
 
 class DayTraderConfig:
     """Intraday trend trader (The 'Slice')"""
-    MAX_POSITIONS = 20
+    MAX_POSITIONS = 10
     PROFIT_TARGET_PCT = 0.015   # +1.5% (Day Trend)
     STOP_LOSS_PCT = 0.005       # -0.5% (Room to breathe)
-    SCAN_INTERVAL_SECONDS = 60
+    SCAN_INTERVAL_SECONDS = 900 # 15 minutes
     USE_WEBSOCKET = False
     WATCHLIST = "my_portfolio.txt"  # Expanded from day_trade_list.txt
     LIQUIDATE_EOD = True
     ONLINE_LEARNING = True
     EXPLORATION_EPSILON = 0.05  # 5% exploration for day trades
+    DATA_FEED = 'iex'  # Free real-time data
 
 
 class CryptoTraderConfig:
@@ -96,6 +100,7 @@ class CryptoTraderConfig:
     MAX_POSITIONS = int(os.getenv("CRYPTO_MAX_POSITIONS", "5"))
     SCAN_INTERVAL_SECONDS = int(os.getenv("CRYPTO_SCAN_INTERVAL_SECONDS", "30"))
     WATCHLIST = os.getenv("CRYPTO_WATCHLIST", "crypto_watchlist.txt")
+    DATA_FEED = 'sip'  # Default, though crypto uses get_crypto_bars
     # Crypto tends to be noisier; default to a bit more exploration.
     EXPLORATION_EPSILON = float(os.getenv("CRYPTO_EXPLORATION_EPSILON", "0.08"))
     # If set, will attempt to close positions when stopping.
@@ -109,11 +114,9 @@ class CryptoTraderConfig:
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
 # Specialized Model Paths (Option A Architecture)
-SWING_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth" # Updated to Best Model
-SCALPER_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"    # Using Swing Best Model for Day (5Min)
-
-# Legacy (fallback)
-SHARED_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth" # Using Swing Best Model for Crypto (1Min)
+SWING_MODEL_PATH = MODEL_DIR / "swing_gen6_finetune_aggressive_update_ep330_balanced.pth"  # Aggressive Update Ep 330 (Record High Profit)
+SCALPER_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Day
+SHARED_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Crypto
 REPLAY_BUFFER_PATH = MODEL_DIR / "replay_buffer.pkl"
 
 # =============================================================================
@@ -127,9 +130,16 @@ class TrainingConfig:
     NUM_WINDOW_FEATURES = 11
     NUM_REGIME_FEATURES = 6
     NUM_PORTFOLIO_FEATURES = 5
-    # Execution realism (basis points; defaults are 0 to preserve existing training behavior)
-    TRANSACTION_COST_BPS = float(os.getenv("TRANSACTION_COST_BPS", "0.0"))
-    SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "0.0"))
+    # Execution realism (basis points)
+    # 7 bps transaction cost + 3 bps slippage = 10 bps total (0.10%) per trade
+    # This discourages frivolous trading and encourages meaningful entries/exits
+    TRANSACTION_COST_BPS = float(os.getenv("TRANSACTION_COST_BPS", "7.0"))
+    SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "3.0"))
+    
+    # Exit Reward Shaping (new)
+    EXIT_PROFIT_BONUS = float(os.getenv("EXIT_PROFIT_BONUS", "0.001"))  # Bonus for profitable exits
+    HOLDING_LOSS_PENALTY = float(os.getenv("HOLDING_LOSS_PENALTY", "0.0001"))  # Penalty per step holding a loser
+    LOSS_THRESHOLD_PCT = float(os.getenv("LOSS_THRESHOLD_PCT", "0.02"))  # -2% triggers holding penalty
     GAMMA = 0.999  # Increased from 0.99 for long-term focus
     LEARNING_RATE = 0.0001
     BATCH_SIZE = 512

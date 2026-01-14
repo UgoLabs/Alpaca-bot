@@ -79,7 +79,10 @@ class PrioritizedReplayBuffer:
         """
         batch = []
         idxs = []
-        segment = self.tree.total() / batch_size
+        total = self.tree.total()
+        if total <= 0:
+            return [], [], np.array([])
+        segment = total / batch_size
         priorities = []
 
         for i in range(batch_size):
@@ -87,13 +90,25 @@ class PrioritizedReplayBuffer:
             b = segment * (i + 1)
             s = random.uniform(a, b)
             (idx, p, data) = self.tree.get(s)
-            priorities.append(p)
+            # Skip invalid entries
+            if data is None or (isinstance(data, int) and data == 0):
+                continue
+            priorities.append(max(p, 1e-8))  # Avoid zero priority
             batch.append(data)
             idxs.append(idx)
 
-        sampling_probabilities = np.array(priorities) / self.tree.total()
+        if len(batch) == 0:
+            return [], [], np.array([])
+
+        sampling_probabilities = np.array(priorities) / max(total, 1e-8)
+        sampling_probabilities = np.clip(sampling_probabilities, 1e-8, 1.0)
         is_weight = np.power(self.tree.count * sampling_probabilities, -beta)
-        is_weight /= is_weight.max()
+        is_weight = np.nan_to_num(is_weight, nan=1.0, posinf=1.0, neginf=1.0)
+        max_weight = is_weight.max()
+        if max_weight > 0:
+            is_weight /= max_weight
+        else:
+            is_weight = np.ones_like(is_weight)
 
         return batch, idxs, is_weight
 

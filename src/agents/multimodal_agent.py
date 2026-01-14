@@ -25,9 +25,10 @@ class MultiModalRLAgent:
         self.epsilon = 1.0
         self.epsilon_min = 0.05
         self.epsilon_decay = 0.999999  # Extremely slow decay for 50k steps * 50 episodes
-        self.learning_rate = 5e-5 # Lower LR for Transformer/BERT
-        self.batch_size = 32
-        self.update_target_every = 1000
+        self.learning_rate = 5e-6  # Slower LR for frequent updates
+        self.batch_size = 64  # Larger batch for stability
+        self.update_target_every = 100  # More frequent soft updates
+        self.tau = 0.005  # Soft update factor (prevents sudden changes)
         self.step_count = 0
         
         # Initialize Multi-Modal Network
@@ -36,28 +37,34 @@ class MultiModalRLAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
-        # Optimizer
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+        # Optimizer with weight decay (L2 regularization) to prevent drift
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=self.learning_rate, weight_decay=1e-4)
         
-        # Memory
+        # Memory - 100k to store diverse experiences across all symbols
         if self.use_per:
-            self.memory = PrioritizedReplayBuffer(capacity=10000)
+            self.memory = PrioritizedReplayBuffer(capacity=100000)
             self.beta = 0.4
             self.beta_increment = 0.00001
         else:
-            self.memory = deque(maxlen=10000)
+            self.memory = deque(maxlen=100000)
 
     def act(self, ts_state, text_ids, text_mask, eval_mode=False):
         if not eval_mode and random.random() < self.epsilon:
             return random.randrange(self.action_dim)
-        
-        with torch.no_grad():
+
+        # Action selection is inference-only; enable faster inference kernels.
+        with torch.inference_mode():
             # Prepare inputs
             ts_state = torch.FloatTensor(ts_state).unsqueeze(0).to(self.device)
             text_ids = torch.LongTensor(text_ids).unsqueeze(0).to(self.device)
             text_mask = torch.LongTensor(text_mask).unsqueeze(0).to(self.device)
-            
-            q_values = self.policy_net(ts_state, text_ids, text_mask)
+
+            use_autocast = isinstance(self.device, str) and self.device.startswith("cuda")
+            if use_autocast:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    q_values = self.policy_net(ts_state, text_ids, text_mask)
+            else:
+                q_values = self.policy_net(ts_state, text_ids, text_mask)
             return q_values.argmax().item()
 
     def remember(self, state, action, reward, next_state, done):
@@ -67,6 +74,34 @@ class MultiModalRLAgent:
         else:
             cast(deque, self.memory).append((state, action, reward, next_state, done))
 
+    def freeze_feature_extractors(self):
+        """Freeze Time-Series and Vision backbones, only train Fusion/Heads."""
+        print("❄️ Freezing Feature Extractors (TS + Vision + Text)...")
+        # Freeze TS Head (Transformer/Encoder)
+        for param in self.policy_net.ts_head.parameters():
+            param.requires_grad = False
+        
+        # Freeze Vision Head
+        for param in self.policy_net.vision_head.parameters():
+            param.requires_grad = False
+            
+        # Text Head
+        for param in self.policy_net.text_head.parameters():
+            param.requires_grad = False
+            
+        # Re-init optimizer to track only active parameters
+        self.optimizer = optim.AdamW(filter(lambda p: p.requires_grad, self.policy_net.parameters()), 
+                                     lr=self.learning_rate, weight_decay=1e-4)
+
+    def unfreeze_all(self):
+        """Unfreeze all layers for full fine-tuning."""
+        print("🔥 Unfreezing All Layers...")
+        for param in self.policy_net.parameters():
+            param.requires_grad = True
+            
+        # Re-init optimizer for all parameters (usually with lower LR)
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=self.learning_rate * 0.1, weight_decay=1e-4)
+
     def train_step(self):
         # Check if enough samples
         if self.use_per:
@@ -74,6 +109,9 @@ class MultiModalRLAgent:
             if len(mem_per) < self.batch_size:
                 return None
             batch, idxs, is_weights = mem_per.sample(self.batch_size, self.beta)
+            # Handle empty batch (corrupted buffer)
+            if not batch or len(batch) < self.batch_size:
+                return None
             # Update Beta
             self.beta = min(1.0, self.beta + self.beta_increment)
         else:
@@ -114,7 +152,7 @@ class MultiModalRLAgent:
         # Loss Calculation
         if self.use_per:
             # Element-wise loss for priority update
-            td_errors = torch.abs(current_q - target_q).detach().cpu().numpy()
+            td_errors = torch.abs(current_q - target_q).detach().cpu().numpy().flatten()
             cast(PrioritizedReplayBuffer, self.memory).update_priorities(idxs, td_errors)
             
             # Weighted Loss
@@ -127,13 +165,13 @@ class MultiModalRLAgent:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
-        # Epsilon Decay
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # NOTE: Epsilon decay moved to episode level in training script
+        # (was decaying too fast per-step)
             
-        # Target Update
+        # Soft Target Update (prevents catastrophic forgetting)
         self.step_count += 1
         if self.step_count % self.update_target_every == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+            for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                target_param.data.copy_(self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
             
         return loss.item()

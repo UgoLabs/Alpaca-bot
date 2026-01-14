@@ -19,24 +19,6 @@ services:
       - BOT_NAME=swing_bot
     restart: unless-stopped
 
-  # 2. Day Trader (Closes positions at EOD)
-  day_bot:
-    build: .
-    container_name: alpaca_day_bot
-    command: python -m src.bots.multimodal_trader --mode day --watchlist config/watchlists/my_portfolio.txt
-    volumes:
-      - ./models:/app/models
-      - ./logs:/app/logs
-      - ./src:/app/src
-      - ./config:/app/config
-      - ./data:/app/data
-    env_file:
-      - .env
-    environment:
-      - PYTHONPATH=/app
-      - BOT_NAME=day_bot
-    restart: unless-stopped
-
   # 3. Crypto Trader (24/7)
   crypto_bot:
     build: .

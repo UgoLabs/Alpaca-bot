@@ -2,9 +2,12 @@ import time
 import os
 import argparse
 import torch
+import pandas as pd
+import numpy as np
 import alpaca_trade_api as tradeapi
 from datetime import datetime, timedelta
 from typing import Optional, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
     DayTraderCreds, SwingTraderCreds, MoneyScraperCreds, CryptoTraderCreds,
@@ -14,7 +17,7 @@ from config.settings import (
 from src.agents.ensemble_agent import EnsembleAgent
 from src.data.pipeline import MultiModalDataPipeline
 from src.data.websocket_stream import AlpacaWebSocketStream
-from src.strategies.supertrend import SupertrendStrategy
+from src.strategies.supertrend import SupertrendStrategy  # <--- Added
 
 
 class MultiModalTrader:
@@ -26,12 +29,6 @@ class MultiModalTrader:
         
         self.mode = mode.lower()
         self.watchlist_path = watchlist_path
-        
-        # Initialize Supertrend for Crypto and Day Mode
-        self.supertrend = None
-        if self.mode in ['crypto', 'day']:
-            print(f"   🦸 Enabling Supertrend Strategy for {self.mode.upper()}...")
-            self.supertrend = SupertrendStrategy(atr_period=10, multiplier=3.0)
         
         # Select Credentials and Config based on mode
         if self.mode == 'swing':
@@ -121,7 +118,8 @@ class MultiModalTrader:
                 print("⚠️ No pre-trained model found. Starting fresh.")
 
         # 4. Initialize Eyes & Ears (Data Pipeline)
-        self.pipeline = MultiModalDataPipeline(window_size=self.window_size)
+        feed = getattr(self.config, 'DATA_FEED', 'sip')
+        self.pipeline = MultiModalDataPipeline(window_size=self.window_size, creds=self.creds, feed=feed)
         
         # 5. WebSocket Stream for Day Trader (real-time 1min -> 5min aggregation)
         self.ws_stream = None
@@ -136,10 +134,47 @@ class MultiModalTrader:
         self.pdt_protection = (self.mode == 'swing')  # Only swing bot needs PDT protection
         self.buy_times: Dict[str, datetime] = {}  # Track when positions were opened
         self.min_hold_hours = 24  # Minimum hold time to avoid day trade (hold overnight)
+
+        # 7. Supertrend Strategy (Crypto Only)
+        self.supertrend = None
+        if self.mode == 'crypto':
+            # Default Crypto Settings: ATR 10, Multiplier 3.0
+            print("🚀 Initializing Supertrend Strategy (Hybrid Logic)...")
+            self.supertrend = SupertrendStrategy(atr_period=10, multiplier=3.0)
+            
+        # 8. Local State Cache (To avoid API Rate Limits)
+        self.cached_positions = []
+        self.cached_cash = 0.0
+        self.cached_buying_power = 0.0
+        self.last_cache_update = datetime.now()
         
         print(f"✅ Bot Ready. Watching {len(self.symbols)} symbols.")
         if self.pdt_protection:
             print(f"🛡️ PDT Protection ENABLED - Min hold time: {self.min_hold_hours}h")
+
+    def refresh_account_state(self):
+        """Pre-fetch account and positions to cache for execution loop."""
+        try:
+            # 1. Get Positions
+            self.cached_positions = self.api.list_positions()
+            
+            # 2. Get Cash & Buying Power
+            account = self.api.get_account()
+            self.cached_cash = float(account.cash)
+            self.cached_buying_power = float(account.buying_power)
+            
+            # Print Summary
+            print(f"\n💰 Equity: ${float(account.equity):.2f} | Cash: ${self.cached_cash:.2f} | BP: ${self.cached_buying_power:.2f}")
+            if self.cached_positions:
+                print(f"📦 Holding {len(self.cached_positions)} positions:")
+                for p in self.cached_positions:
+                    print(f"   • {p.symbol}: {p.qty}")
+            else:
+                print("📦 No open positions.")
+                
+        except Exception as e:
+            print(f"⚠️ Error refreshing account state: {e}")
+
     
     def _seed_websocket_history(self):
         """Seed WebSocket aggregator with historical 5-min bars."""
@@ -233,10 +268,6 @@ class MultiModalTrader:
         
         return ts_state, input_ids, attention_mask, current_price
 
-    def get_positions(self):
-        positions = self.api.list_positions()
-        return {p.symbol: p for p in positions}
-
     def execute_trade(self, symbol, action, current_price):
         """
         Action Map: 0=Hold, 1=Buy, 2=Sell
@@ -246,16 +277,14 @@ class MultiModalTrader:
             return
 
         try:
-            # Check existing position
-            positions_dict = self.get_positions()
+            # Use Cached Positions
+            positions_dict = {p.symbol: p for p in self.cached_positions}
             has_position = symbol in positions_dict
             qty_held = float(positions_dict[symbol].qty) if has_position else 0.0
             
-            # Filter positions by asset class to respect per-bot limits
-            # Crypto Bot counts Crypto; Day/Swing Bots count Equities
-            all_positions_list = self.api.list_positions()
+            # Filter positions by asset class (Crypto vs Equity)
             target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
-            my_positions = [p for p in all_positions_list if p.asset_class == target_asset_class]
+            my_positions = [p for p in self.cached_positions if p.asset_class == target_asset_class]
             
             # Determine TIF
             tif = 'gtc' if self.mode == 'crypto' else 'day'
@@ -269,14 +298,14 @@ class MultiModalTrader:
                 if self.pdt_protection:
                     self.buy_times[symbol] = datetime.now()
                 
-                # 1. Check Max Positions (Filtered by Asset Class)
+                # 1. Check Max Positions
                 if len(my_positions) >= self.config.MAX_POSITIONS:
                     print(f"   ⚠️ Max positions reached ({len(my_positions)}/{self.config.MAX_POSITIONS}) for {target_asset_class}. Skipping BUY.")
                     return
 
-                # 2. Dynamic Position Sizing
-                account = self.api.get_account()
-                cash = float(account.cash)
+                # 2. Dynamic Position Sizing (Use Buying Power for Margin Support)
+                # Was: cash = self.cached_cash (Too conservative for margin accounts)
+                cash = self.cached_buying_power
                 
                 # Slots remaining
                 slots_left = self.config.MAX_POSITIONS - len(my_positions)
@@ -287,10 +316,10 @@ class MultiModalTrader:
                 else:
                     target_val = 0 # Should be caught by max positions check
                 
-                # Cap at 95% of cash to leave room for fees/slippage
+                # Cap at 95% of cash
                 target_val = min(target_val, cash * 0.95)
 
-                if target_val < 10.0: # Alpaca min is roughly $1 or $10 depending on asset, keeping $10 safe
+                if target_val < 10.0:
                     print(f"   ⚠️ Insufficient cash (${cash:.2f}) for {symbol} (Allocated: ${target_val:.2f}). Skipping.")
                     return
 
@@ -305,7 +334,7 @@ class MultiModalTrader:
                 if self.mode == 'crypto':
                     qty = float(f"{qty:.4f}")
                 else:
-                    qty = int(qty) # Stocks usually whole shares
+                    qty = int(qty)
                     if qty < 1:
                         print(f"   ⚠️ Calculated quantity 0 for {symbol} (${target_val:.2f}). Skipping.")
                         return
@@ -319,12 +348,22 @@ class MultiModalTrader:
                     time_in_force=tif
                 )
                 
+                # Optimistic Update of Cache
+                self.cached_cash -= (qty * current_price)
+                # Mock a new position object (simplified)
+                class MockPos:
+                    def __init__(self, s, q, ac):
+                        self.symbol = s
+                        self.qty = q
+                        self.asset_class = ac
+                self.cached_positions.append(MockPos(symbol, qty, target_asset_class))
+                
             elif action == 2:  # SELL
                 if not has_position:
                     print(f"   ⚠️ {symbol}: No position to SELL.")
                     return
                 
-                # PDT Protection: Check minimum hold time
+                # PDT Protection
                 if self.pdt_protection and symbol in self.buy_times:
                     buy_time = self.buy_times[symbol]
                     hold_duration = datetime.now() - buy_time
@@ -343,8 +382,13 @@ class MultiModalTrader:
                     time_in_force=tif
                 )
                 
+                # Optimistic Update
+                self.cached_cash += (qty_held * current_price)
+                self.cached_positions = [p for p in self.cached_positions if p.symbol != symbol]
+                
         except Exception as e:
             print(f"   ❌ Order Failed: {e}")
+
 
     def liquidate_all_positions(self):
         print(f"🚨 LIQUIDATING ALL POSITIONS ({self.mode.upper()} Mode) 🚨")
@@ -367,6 +411,38 @@ class MultiModalTrader:
             print(f"✅ All {target_asset_class} positions liquidated.")
         except Exception as e:
             print(f"❌ Error liquidating positions: {e}")
+
+    def _calculate_atr_trailing_stop(self, df, atr_period=14, multiplier=3.0):
+        """
+        Calculates Chandelier Exit (Long)
+        Stop = Highest High (last N) - ATR(N) * Multiplier
+        """
+        try:
+            # Handle case sensitivity for columns
+            high = df['High'] if 'High' in df.columns else df['high']
+            low = df['Low'] if 'Low' in df.columns else df['low']
+            close = df['Close'] if 'Close' in df.columns else df['close']
+            
+            # Calculate TR
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            # Calculate ATR
+            atr = tr.rolling(window=atr_period).mean()
+            
+            # Calculate Highest High over the period
+            highest_high = high.rolling(window=atr_period).max()
+            
+            # Calculate Stop
+            stop_price = highest_high - (atr * multiplier)
+
+            atr_value = atr.iloc[-1]
+            return stop_price.iloc[-1], atr_value
+        except Exception as e:
+            print(f"Error calculating trailing stop: {e}. Columns: {df.columns}")
+            return None, None
 
     def run_loop(self):
         # Determine Timeframe
@@ -428,104 +504,142 @@ class MultiModalTrader:
                     print(f"⚠️ Error checking clock: {e}")
                     time.sleep(60)
             
-            # --- Account Summary ---
-            try:
-                account = self.api.get_account()
-                positions = self.api.list_positions()
-                print(f"\n💰 Equity: ${float(account.equity):.2f} | Cash: ${float(account.cash):.2f}")
-                if positions:
-                    print(f"📦 Holding {len(positions)} positions:")
-                    for p in positions:
-                        print(f"   • {p.symbol}: {p.qty}")
-                else:
-                    print("📦 No open positions.")
-            except Exception as e:
-                print(f"⚠️ Error fetching account info: {e}")
+            # --- Refresh Account State (CACHE) ---
+            self.refresh_account_state()
 
             print(f"\n⏰ Scan Time: {datetime.now().strftime('%H:%M:%S')}")
             
-            for symbol in self.symbols:
+            # --- RANKING LOGIC START ---
+            scored_opportunities = [] 
+            
+            print(f"🔍 Scanning {len(self.symbols)} symbols for RANKING (Split Phase)...")
+            
+            # --- PHASE 1: PARALLEL DATA FETCHING (I/O BOUND) ---
+            fetch_start = time.time()
+            data_results = []
+            
+            def fetch_symbol_task(symbol):
+                """Phase 1: Pure Data Fetching"""
                 try:
-                    print(f"🔍 Scanning {symbol}...")
-                    
-                    # 1. Fetch Data - Use WebSocket for Day Trader, REST for others
+                    # 1. Fetch Data
                     if self.mode == 'day' and self.ws_stream:
-                        # Get real-time 5-min bars from WebSocket aggregator
                         data = self._get_websocket_data(symbol)
                     else:
-                        # Use REST API pipeline for Swing/Crypto
                         data = self.pipeline.fetch_and_process(symbol, timeframe=timeframe)
                     
                     if data is None:
-                        print(f"   ⚠️ Insufficient data for {symbol}")
-                        continue
+                        return None
                         
                     ts_state, text_ids, text_mask, current_price = data
-                    
                     # Reshape TS State: (Flattened) -> (Window, Features)
                     ts_state = ts_state.reshape(self.window_size, self.num_features)
                     
-                    # 2. Ask Agent
-                    action = self.agent.act(ts_state, text_ids, text_mask, eval_mode=True)
-                    
-                    # --- SUPER TREND STRATEGY (AI + Supertrend) ---
-                    if (self.mode == 'crypto' or self.mode == 'day') and self.supertrend:
-                        try:
-                            # Fetch data for Supertrend
-                            df_st_data = None
-                            if self.mode == 'day' and self.ws_stream:
-                                df_st_data = self.ws_stream.get_bars(symbol)
-                            else:
-                                df_st_data = self.pipeline.market_fetcher.get_bars(symbol, lookback_days=2, timeframe=timeframe)
+                    return (symbol, ts_state, text_ids, text_mask, current_price)
+                except Exception:
+                    return None
 
-                            if df_st_data is not None and not df_st_data.empty and len(df_st_data) > 20:
-                                # Calculate Supertrend
-                                df_st = self.supertrend.calculate_supertrend(df_st_data)
-                                is_bullish = df_st['trend'].iloc[-1]
-                                st_val = df_st['supertrend'].iloc[-1]
-                                
-                                print(f"   🦸 Supertrend: {'BULLISH' if is_bullish else 'BEARISH'} (${st_val:.2f})")
-                                
-                                # Logic: Supertrend drives the trade. AI acts as confirmation or is overridden.
-                                # User Request: "Buy when bullish, Sell when bearish"
-                                
-                                if is_bullish:
-                                    # Supertrend says UP
-                                    if action == 1: # AI BUY
-                                        print(f"   ✅ Supertrend & AI agree: BULLISH. Executing BUY.")
-                                    elif action == 0: # AI HOLD
-                                        print(f"   🚀 Supertrend is BULLISH (AI Holding). Forcing BUY.")
-                                        action = 1
-                                    elif action == 2: # AI SELL
-                                        print(f"   🛡️ Supertrend is BULLISH. Overriding AI Sell -> HOLD.")
-                                        action = 0
-                                else:
-                                    # Supertrend says DOWN
-                                    if action == 1: # AI BUY
-                                        print(f"   🛑 Supertrend is BEARISH. Blocking AI Buy -> HOLD.")
-                                        action = 0
-                                    elif action == 2: # AI SELL
-                                        print(f"   ✅ Supertrend & AI agree: BEARISH. Executing SELL.")
-                                    elif action == 0: # AI HOLD
-                                        # If we hold it, sell it.
-                                        positions = self.get_positions()
-                                        if symbol in positions:
-                                            print(f"   📉 Supertrend is BEARISH. Forcing SELL.")
-                                            action = 2
-                                
-                        except Exception as e:
-                            print(f"   ⚠️ Supertrend Error: {e}")
-
-                    # 3. Execute
-                    action_str = ["HOLD", "BUY", "SELL"][action]
-                    print(f"   🧠 Model Decision: {action_str}")
-                    
-                    self.execute_trade(symbol, action, current_price)
-                    
-                except Exception as e:
-                    print(f"   ❌ Error processing {symbol}: {e}")
+            # 20 Workers for Swing, 5 for others
+            workers = 20 if self.mode == 'swing' else 5 
             
-            # Day trader scans more frequently (every 30 sec), others every 60 sec
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_symbol = {executor.submit(fetch_symbol_task, sym): sym for sym in self.symbols}
+                
+                completed_count = 0
+                total = len(self.symbols)
+                
+                for future in as_completed(future_to_symbol):
+                    completed_count += 1
+                    if completed_count % 10 == 0:
+                        print(f"   ⏳ Fetched {completed_count}/{total}...", end='\r')
+                        
+                    res = future.result()
+                    if res:
+                        data_results.append(res)
+            
+            fetch_duration = time.time() - fetch_start
+            print(f"\n   ✅ Data Fetch Complete in {fetch_duration:.2f}s. (Found {len(data_results)} valid valid items)")
+
+            # --- PHASE 2: INFERENCE (CPU BOUND) ---
+            # Process sequentially (or batched) to respect GIL and avoid overhead
+            print(f"   🧠 Running Inference & Filters...")
+            
+            for symbol, ts_state, text_ids, text_mask, current_price in data_results:
+                try:
+                    # Agent Act
+                    action, confidence = self.agent.act(ts_state, text_ids, text_mask, eval_mode=True, return_q=True)
+                    
+                    # --- FILTERS ---
+                    # --- SWING TRADER: NATURAL TRAILING STOP (Chandelier Exit) ---
+                    if self.mode == 'swing':
+                        try:
+                            df_daily = self.pipeline.market_fetcher.get_bars(symbol, lookback_days=40, timeframe='1D')
+                            if df_daily is not None and not df_daily.empty and len(df_daily) > 20:
+                                stop_price, atr_value = self._calculate_atr_trailing_stop(
+                                    df_daily, atr_period=14, multiplier=self.config.TRAILING_ATR_MULT
+                                )
+                                if stop_price is not None:
+                                    if current_price < stop_price:
+                                        action = 2 # Force Sell
+                        except Exception: pass
+
+                    # --- CRYPTO TRADER: SUPERTREND FILTER ---
+                    if self.mode == 'crypto' and self.supertrend:
+                        try:
+                            df_bars = self.pipeline.market_fetcher.get_bars(symbol, lookback_days=2, timeframe='1Min')
+                            if df_bars is not None and len(df_bars) > 20:
+                                df_st = self.supertrend.calculate_supertrend(df_bars.copy())
+                                last_trend = df_st['trend'].iloc[-1]
+                                if action == 1 and not last_trend:
+                                    action = 0 # Block Buy
+                                elif (action == 0 or action == 2):
+                                    pass 
+                        except Exception: pass
+
+                    # Store
+                    scored_opportunities.append({
+                        'symbol': symbol,
+                        'action': action,
+                        'confidence': float(confidence),
+                        'price': current_price
+                    })
+
+                    # Verbose Print
+                    act_str = ["HOLD", "BUY", "SELL"][action]
+                    print(f"   👉 {symbol}: {act_str} (Conf: {confidence:.3f})")
+
+                except Exception as e:
+                    print(f"   ❌ Inference failed for {symbol}: {e}")
+
+            # --- RANKING LOGIC END ---
+            
+            # Sort by Confidence (Descending)
+            # We want high confidence BUYs first.
+            # actions: 0=HOLD, 1=BUY, 2=SELL.
+            # We separate them.
+            
+            buys = [x for x in scored_opportunities if x['action'] == 1]
+            sells = [x for x in scored_opportunities if x['action'] == 2]
+            
+            # Sort BUYs by confidence (Higher Q-value = Better)
+            buys.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            if buys:
+                print(f"\n📊 TOP RANKED BUY OPPORTUNITIES (Execution Optimization Active):")
+                for i, item in enumerate(buys[:10]):
+                     print(f"   {i+1}. {item['symbol']} (Conf: {item['confidence']:.3f})")
+                print("-" * 30)
+            
+            # Execute SELLs first (Free up cash)
+            for item in sells:
+                print(f"📉 Executing SELL for {item['symbol']} (Conf: {item['confidence']:.2f})")
+                self.execute_trade(item['symbol'], 2, item['price'])
+                
+            # Execute BUYs (Top N)
+            for item in buys:
+                print(f"📈 Executing BUY for {item['symbol']} (Conf: {item['confidence']:.2f})")
+                self.execute_trade(item['symbol'], 1, item['price'])
+
+            # Sleep
             sleep_time = 30 if self.mode == 'day' else 60
             print(f"💤 Sleeping for {sleep_time} seconds...")
             time.sleep(sleep_time)
