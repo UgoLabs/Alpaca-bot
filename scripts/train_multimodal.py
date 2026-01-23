@@ -21,18 +21,33 @@ from src.agents.ensemble_agent import EnsembleAgent  # noqa: E402
 from src.core.indicators import add_technical_indicators  # noqa: E402
 
 
-def load_all_data(timeframe="1Min"):
-    print("📥 Loading Historical Data...")
-    pattern = os.path.join("data/historical", f"*_{timeframe}.csv")
+def load_all_data(timeframe="1D", train_end_date="2023-12-31"):
+    """
+    Load data with train/test split to prevent data leakage.
+    
+    Args:
+        timeframe: "1D" for swing, "1Min" for scalp
+        train_end_date: Last date for training data (everything after is held out for testing)
+    """
+    print(f"📥 Loading Historical Data ({timeframe})...")
+    print(f"📅 Training cutoff: {train_end_date} (data after this is reserved for backtesting)")
+    
+    if timeframe == "1Min":
+        data_dir = "data/historical"
+    else:
+        data_dir = "data/historical_swing"
+        
+    pattern = os.path.join(data_dir, f"*_{timeframe}.csv")
     files = glob.glob(pattern)
     
     if not files:
-        print("❌ No data found in data/historical!")
+        print(f"❌ No data found in {data_dir} for {timeframe}!")
         return None, None
         
     data_list = []
     price_list = []
-    MAX_LEN = 5000  # Set to 5000 as requested
+    # 8 years of daily data = ~2000 trading days. Use actual data length, no padding.
+    MAX_LEN = 2000
     
     # --- SMART SELECTION LOGIC ---
     # User requested: Top 100, Tech Heavy, Diversified, Important Symbols
@@ -64,28 +79,34 @@ def load_all_data(timeframe="1Min"):
     # Categorize files
     for f in files:
         filename = os.path.basename(f)
-        symbol = filename.replace('_1Min.csv', '').upper()
+        # Dynamic replacement for cleaner symbol extraction
+        symbol = filename.replace(f'_{timeframe}.csv', '').upper() 
         if symbol in PRIORITY_SYMBOLS:
             priority_files.append(f)
         else:
             other_files.append(f)
             
-    # Select 100 Total
-    TARGET_COUNT = 100
+    # Select All Available
+    # TARGET_COUNT = 100
     
     # 1. Take all available priority files
     selected_files = list(priority_files)
+    selected_files.extend(other_files) # Add all other files
+    
+    # Randomize order
+    import random
+    random.shuffle(selected_files)
     
     # 2. Fill the rest with random selection from others to diversify
-    remaining_slots = TARGET_COUNT - len(selected_files)
+    # remaining_slots = TARGET_COUNT - len(selected_files)
     
-    if remaining_slots > 0 and other_files:
+    # if remaining_slots > 0 and other_files:
         # Shuffle others to ensure random diversity each run
-        import random
-        random.shuffle(other_files)
-        selected_files.extend(other_files[:remaining_slots])
+        # import random
+        # random.shuffle(other_files)
+        # selected_files.extend(other_files[:remaining_slots])
     
-    print(f"📊 Training Selection: {len(priority_files)} Priority + {len(selected_files)-len(priority_files)} Random = {len(selected_files)} Total Symbols")
+    print(f"📊 Training Selection: {len(priority_files)} Priority + {len(other_files)} Others = {len(selected_files)} Total Symbols")
     
     for f in tqdm(selected_files, desc="Processing CSVs"):
         try:
@@ -102,6 +123,14 @@ def load_all_data(timeframe="1Min"):
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col in df.columns:
                     df[col.capitalize()] = df[col]
+            
+            # === TRAIN/TEST SPLIT: Filter to training period only ===
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df[df['date'] <= train_end_date]
+            elif 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df[df['Date'] <= train_end_date]
 
             # Add Indicators
             df = add_technical_indicators(df)
@@ -149,6 +178,10 @@ def load_all_data(timeframe="1Min"):
             
     if not data_list:
         return None, None
+    
+    # === BEAR MARKET OVERSAMPLING (DISABLED - too slow) ===
+    # Instead, the random start positions in VectorizedEnv naturally sample all periods
+    print(f"📊 Loaded {len(data_list)} symbols")
         
     # Stack into Tensors
     # Shape: (Num_Envs, Time, Features)
@@ -165,14 +198,22 @@ def train():
     writer = SummaryWriter(log_dir="logs/runs/ensemble_experiment_1")
     
     # 1. Load Data
-    data, prices = load_all_data()
+    data, prices = load_all_data(timeframe="1D")
     if data is None:
         return
     
     print(f"📊 Data Shape: {data.shape}")
     
-    # 2. Initialize Environment
-    env = VectorizedTradingEnv(data, prices, device=device)
+    # 2. Initialize Environment with LIVE TRADING PARAMETERS
+    # Position sizing: 1/10 of capital per position (max 10 positions)
+    env = VectorizedTradingEnv(data, prices, device=device, position_pct=0.10)
+    
+    # Override initial balance to match live account
+    env.initial_balance = 10000.0
+    env.balance.fill_(10000.0)
+    env.prev_equity.fill_(10000.0)
+    
+    print(f"💰 Live params: $10,000 starting capital, 10% position sizing (max 10 positions)")
     
     # 3. Initialize Ensemble Agent
     num_features = data.shape[2]
@@ -183,39 +224,44 @@ def train():
         device=device
     )
     
-    # Check for existing checkpoints
+    # Check for existing checkpoints (skip if --fresh flag is passed)
     start_episode = 0
-    checkpoints = glob.glob("models/ensemble_ep*_balanced.pth")
-    if checkpoints:
-        # Extract episode numbers
-        ep_nums = []
-        for cp in checkpoints:
-            try:
-                # Format: models/ensemble_ep5_balanced.pth
-                num = int(cp.split("ensemble_ep")[1].split("_")[0])
-                ep_nums.append(num)
-            except:
-                pass
-        
-        if ep_nums:
-            latest_ep = max(ep_nums)
-            print(f"🔄 Found checkpoint for Episode {latest_ep}. Resuming...")
-            agent.load(f"models/ensemble_ep{latest_ep}")
-            start_episode = latest_ep
+    fresh_start = "--fresh" in sys.argv
+    
+    if fresh_start:
+        print("🆕 Fresh start requested. Ignoring existing checkpoints.")
+    else:
+        checkpoints = glob.glob("models/ensemble_ep*_balanced.pth")
+        if checkpoints:
+            # Extract episode numbers
+            ep_nums = []
+            for cp in checkpoints:
+                try:
+                    # Format: models/ensemble_ep5_balanced.pth
+                    num = int(cp.split("ensemble_ep")[1].split("_")[0])
+                    ep_nums.append(num)
+                except:
+                    pass
             
-            # Recalculate Epsilon for the new schedule
-            # User requested fixed exploration of 0.4
-            new_epsilon = 0.4
-            # Adjust decay to reach 0.05 by Episode 100 (approx 250k steps)
-            new_decay = 0.99999 
-            print(f"🔄 Adjusting Epsilon to {new_epsilon:.4f} and Decay to {new_decay} for Episode {start_episode+1}")
-            
-            for sub_agent in agent.agents:
-                sub_agent.epsilon = new_epsilon
-                sub_agent.epsilon_decay = new_decay
+            if ep_nums:
+                latest_ep = max(ep_nums)
+                print(f"🔄 Found checkpoint for Episode {latest_ep}. Resuming...")
+                agent.load(f"models/ensemble_ep{latest_ep}")
+                start_episode = latest_ep
+                
+                # Recalculate Epsilon for the new schedule
+                # User requested fixed exploration of 0.4
+                new_epsilon = 0.4
+                # Adjust decay to reach 0.05 by Episode 100 (approx 250k steps)
+                new_decay = 0.99999 
+                print(f"🔄 Adjusting Epsilon to {new_epsilon:.4f} and Decay to {new_decay} for Episode {start_episode+1}")
+                
+                for sub_agent in agent.agents:
+                    sub_agent.epsilon = new_epsilon
+                    sub_agent.epsilon_decay = new_decay
 
     # 4. Training Loop
-    EPISODES = 100
+    EPISODES = 200 
     # writer = SummaryWriter(log_dir="logs/runs/ensemble_experiment_1") # Moved to top
     
     # Dummy Text Data (since we don't have historical news)
@@ -234,6 +280,10 @@ def train():
         
         pbar = tqdm(total=steps_per_episode, desc=f"Episode {episode+1}/{EPISODES}")
         
+        # Pre-compute dummy text once (saves repeated .cpu().numpy() calls)
+        dummy_text_ids_np = dummy_text_ids[0].cpu().numpy()
+        dummy_text_mask_np = dummy_text_mask[0].cpu().numpy()
+        
         for step_idx in range(steps_per_episode):
             # Ensemble Action
             actions = agent.batch_act(state, dummy_text_ids, dummy_text_mask)
@@ -241,33 +291,32 @@ def train():
             # Step Env
             next_state, rewards, dones, _ = env.step(actions)
             
-            # Store Experience & Train
-            # Move to CPU for storage to save VRAM
-            state_cpu = state.cpu().numpy()
-            next_state_cpu = next_state.cpu().numpy()
-            actions_cpu = actions.cpu().numpy()
-            rewards_cpu = rewards.cpu().numpy()
-            dones_cpu = dones.cpu().numpy()
+            # Store Experience & Train (OPTIMIZED: sample subset instead of all)
+            # Only store 10% of transitions per step to reduce memory overhead
+            sample_size = max(1, env.num_envs // 10)
+            sample_indices = np.random.choice(env.num_envs, sample_size, replace=False)
             
-            # Store transitions for each environment
-            # Note: This loop can be slow. In production, optimize with batch add.
-            for i in range(env.num_envs):
-                # State tuple: (ts, text_ids, text_mask)
-                s = (state_cpu[i], dummy_text_ids[i].cpu().numpy(), dummy_text_mask[i].cpu().numpy())
-                ns = (next_state_cpu[i], dummy_text_ids[i].cpu().numpy(), dummy_text_mask[i].cpu().numpy())
-                
+            state_cpu = state[sample_indices].cpu().numpy()
+            next_state_cpu = next_state[sample_indices].cpu().numpy()
+            actions_cpu = actions[sample_indices].cpu().numpy()
+            rewards_cpu = rewards[sample_indices].cpu().numpy()
+            dones_cpu = dones[sample_indices].cpu().numpy()
+            
+            for i in range(sample_size):
+                s = (state_cpu[i], dummy_text_ids_np, dummy_text_mask_np)
+                ns = (next_state_cpu[i], dummy_text_ids_np, dummy_text_mask_np)
                 agent.remember(s, actions_cpu[i], rewards_cpu[i], ns, dones_cpu[i])
             
             # Train Step (Trains all 3 agents)
             losses = agent.train_step()
             
-            # Log to TensorBoard
-            global_step = episode * steps_per_episode + step_idx
-            if losses:
-                for name, loss in losses.items():
-                    writer.add_scalar(f"Loss/{name}", loss, global_step)
-            
-            writer.add_scalar("Epsilon/Balanced", agent.balanced.epsilon, global_step)
+            # Log to TensorBoard (less frequently to reduce overhead)
+            if step_idx % 100 == 0:
+                global_step = episode * steps_per_episode + step_idx
+                if losses:
+                    for name, loss in losses.items():
+                        writer.add_scalar(f"Loss/{name}", loss, global_step)
+                writer.add_scalar("Epsilon/Balanced", agent.balanced.epsilon, global_step)
             
             state = next_state
             total_reward += rewards.sum().item()
@@ -277,6 +326,16 @@ def train():
             
         pbar.close()
         writer.add_scalar("Reward/Episode_Total", total_reward, episode)
+        
+        # ===== EPSILON DECAY (per episode) =====
+        # Decay from 1.0 to 0.05 over 50 episodes
+        # Formula: eps * decay^episode = eps_min => decay = (eps_min/eps)^(1/episodes)
+        # decay = (0.05/1.0)^(1/50) ≈ 0.94
+        eps_decay_per_episode = 0.94
+        for sub_agent in agent.agents:
+            sub_agent.epsilon = max(sub_agent.epsilon_min, sub_agent.epsilon * eps_decay_per_episode)
+        
+        print(f"📉 Epsilon decayed to {agent.balanced.epsilon:.4f}")
         
         # Save Models
         if (episode + 1) % 5 == 0:

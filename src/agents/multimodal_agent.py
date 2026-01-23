@@ -48,24 +48,54 @@ class MultiModalRLAgent:
         else:
             self.memory = deque(maxlen=100000)
 
-    def act(self, ts_state, text_ids, text_mask, eval_mode=False):
-        if not eval_mode and random.random() < self.epsilon:
-            return random.randrange(self.action_dim)
+    def act(self, ts_state, text_ids, text_mask, eval_mode=False, return_q=False):
+        # In eval_mode (live trading), ALWAYS use model inference - no random exploration
+        if eval_mode:
+            pass  # Skip to inference below
+        elif random.random() < self.epsilon:
+            # Training only: random exploration
+            action = random.randrange(self.action_dim)
+            if return_q:
+                # Training exploration - return uniform Q for gradient purposes
+                dummy_q = torch.ones(self.action_dim, device=self.device) / self.action_dim
+                return action, dummy_q
+            return action
 
-        # Action selection is inference-only; enable faster inference kernels.
+        # REAL MODEL INFERENCE (always used for live trading)
         with torch.inference_mode():
-            # Prepare inputs
-            ts_state = torch.FloatTensor(ts_state).unsqueeze(0).to(self.device)
-            text_ids = torch.LongTensor(text_ids).unsqueeze(0).to(self.device)
-            text_mask = torch.LongTensor(text_mask).unsqueeze(0).to(self.device)
+            # Check if already batched (tensor with batch dim)
+            if isinstance(ts_state, torch.Tensor) and ts_state.dim() >= 2:
+                # Already batched - use as-is
+                ts_batch = ts_state.to(self.device)
+                ids_batch = text_ids.to(self.device)
+                mask_batch = text_mask.to(self.device)
+                is_batch = ts_batch.shape[0] > 1
+            else:
+                # Single sample - add batch dimension
+                ts_batch = torch.FloatTensor(ts_state).unsqueeze(0).to(self.device)
+                ids_batch = torch.LongTensor(text_ids).unsqueeze(0).to(self.device)
+                mask_batch = torch.LongTensor(text_mask).unsqueeze(0).to(self.device)
+                is_batch = False
 
             use_autocast = isinstance(self.device, str) and self.device.startswith("cuda")
             if use_autocast:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    q_values = self.policy_net(ts_state, text_ids, text_mask)
+                    q_values = self.policy_net(ts_batch, ids_batch, mask_batch)
             else:
-                q_values = self.policy_net(ts_state, text_ids, text_mask)
-            return q_values.argmax().item()
+                q_values = self.policy_net(ts_batch, ids_batch, mask_batch)
+            
+            if is_batch:
+                # Return batch of actions
+                actions = q_values.argmax(dim=1)
+                if return_q:
+                    return actions, q_values
+                return actions
+            else:
+                # Single sample
+                action = q_values.argmax().item()
+                if return_q:
+                    return action, q_values.squeeze(0)
+                return action
 
     def remember(self, state, action, reward, next_state, done):
         # state is tuple: (ts_data, text_ids, text_mask)

@@ -60,6 +60,15 @@ class VectorizedTradingEnv:
         
         # Track how long we've been in a position (for holding penalty)
         self.steps_in_position = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        
+        # ===== REGIME-AWARE REWARD SHAPING =====
+        # Instead of oversampling bear markets, we give BONUS rewards for
+        # correct actions during downtrends. This teaches the model without slowing training.
+        self.regime_reward_mult = float(getattr(TrainingConfig, 'REGIME_REWARD_MULT', 2.0))  # 2x reward during bear
+        self.trend_lookback = int(getattr(TrainingConfig, 'TREND_LOOKBACK', 20))  # Days to detect trend
+        
+        # Reward scaling for better Q-value spread
+        self.reward_scale = float(getattr(TrainingConfig, 'REWARD_SCALE', 100.0))  # Scale up tiny log-returns
 
         # ===== TRAILING STOP & PROFIT-TAKE (applied during training) =====
         # DISABLED for training - let the model learn exit timing itself
@@ -219,22 +228,48 @@ class VectorizedTradingEnv:
         equity_tp1 = self.balance + self.shares * next_prices
         safe_equity_t = torch.clamp(equity_t, min=1e-6)
         reward_lr = torch.log(torch.clamp(equity_tp1 / safe_equity_t, min=1e-6))
-        rewards = reward_lr
         
-        # EXIT REWARD SHAPING: Bonus for profitable exits (applied AFTER base reward)
+        # ===== REWARD SCALING: Scale up tiny log-returns for better Q-value spread =====
+        # Log-returns are typically -0.001 to +0.001. Scale to -0.1 to +0.1 range.
+        rewards = reward_lr * self.reward_scale
+        
+        # ===== REGIME-AWARE REWARD SHAPING =====
+        # Detect bear market: price < SMA(lookback) for this step
+        # Give BONUS rewards for correct bear market behavior:
+        # - HOLD/SELL when flat in downtrend = good (avoided loss)
+        # - SELL when in position during downtrend = good (cut losses)
+        # - BUY in downtrend that works = extra bonus (caught the reversal)
+        lookback_step = torch.clamp(self.current_step - self.trend_lookback, min=0)
+        lookback_prices = self.prices[self._row_indices, lookback_step]
+        in_downtrend = current_prices < lookback_prices * 0.95  # Price 5%+ below lookback = bear
+        
+        if in_downtrend.any():
+            # Correct behavior in downtrend gets multiplied reward
+            # SELL in downtrend while in position = smart exit
+            smart_exit = sell_mask & in_downtrend & (sell_pnl_pct < 0)  # Cut losses
+            if smart_exit.any():
+                # Reduce the loss penalty - cutting losses early is GOOD
+                rewards[smart_exit] *= 0.5  # Halve the negative reward for smart exits
+            
+            # HOLD when flat in downtrend = correctly avoided buying the dip too early
+            smart_hold = (effective_actions == 0) & (~self.in_position) & in_downtrend
+            if smart_hold.any():
+                rewards[smart_hold] += 0.01 * self.reward_scale  # Small bonus for patience
+        
+        # ===== EXIT REWARD SHAPING: Bonus for profitable exits =====
         profitable_exits = sell_mask & (sell_pnl_pct > 0)
         if profitable_exits.any():
-            profit_bonus = torch.clamp(sell_pnl_pct[profitable_exits], max=0.10) * self.exit_profit_bonus * 10
+            profit_bonus = torch.clamp(sell_pnl_pct[profitable_exits], max=0.10) * self.exit_profit_bonus * 10 * self.reward_scale
             rewards[profitable_exits] += profit_bonus
         
-        # HOLDING LOSS PENALTY: Penalize holding losing positions
+        # ===== HOLDING LOSS PENALTY: Penalize holding losing positions =====
         if self.in_position.any():
             unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
             losing_positions = self.in_position & (unrealized_pnl_pct < -self.loss_threshold_pct)
             if losing_positions.any():
                 # Penalty scales with how long we've been holding the loser
                 hold_time_factor = torch.clamp(self.steps_in_position[losing_positions].float() / 10.0, max=5.0)
-                loss_penalty = self.holding_loss_penalty * hold_time_factor
+                loss_penalty = self.holding_loss_penalty * hold_time_factor * self.reward_scale
                 rewards[losing_positions] -= loss_penalty
 
         # Small penalty for invalid actions (keeps gradients pointing away from nonsense)

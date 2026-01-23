@@ -4,6 +4,8 @@ import argparse
 import torch
 import pandas as pd
 import numpy as np
+import subprocess
+import sys
 import alpaca_trade_api as tradeapi
 from datetime import datetime, timedelta
 from typing import Optional, Dict
@@ -56,6 +58,11 @@ class MultiModalTrader:
         
         # 2. Configuration
         self.symbols = self._load_watchlist()
+
+        # Update Historical Data (Swing Mode Only) - Fill gaps
+        if self.mode == 'swing':
+            self._update_historical_data()
+
         self.window_size = 60
         self.num_features = 11 # OHLCV + 6 Indicators
         self.vision_channels = 11 # Same as features for 1D ResNet
@@ -135,6 +142,10 @@ class MultiModalTrader:
         self.buy_times: Dict[str, datetime] = {}  # Track when positions were opened
         self.min_hold_hours = 24  # Minimum hold time to avoid day trade (hold overnight)
 
+        # Restore buy times from API if needed
+        if self.pdt_protection:
+            self._restore_buy_times()
+
         # 7. Supertrend Strategy (Crypto Only)
         self.supertrend = None
         if self.mode == 'crypto':
@@ -151,6 +162,20 @@ class MultiModalTrader:
         print(f"✅ Bot Ready. Watching {len(self.symbols)} symbols.")
         if self.pdt_protection:
             print(f"🛡️ PDT Protection ENABLED - Min hold time: {self.min_hold_hours}h")
+
+    def _update_historical_data(self):
+        """Runs the external data download script to update local CSVs."""
+        print("🔄 Checking/Updating Historical Data...")
+        try:
+            cmd = [sys.executable, "scripts/download_data.py"]
+            if self.watchlist_path:
+                cmd.extend(["--watchlist", self.watchlist_path])
+            
+            # Run update. Wait for it to finish.
+            subprocess.check_call(cmd)
+            print("✅ Data update complete.")
+        except Exception as e:
+            print(f"⚠️ Failed to update data: {e}. Continuing with existing data...")
 
     def refresh_account_state(self):
         """Pre-fetch account and positions to cache for execution loop."""
@@ -268,7 +293,7 @@ class MultiModalTrader:
         
         return ts_state, input_ids, attention_mask, current_price
 
-    def execute_trade(self, symbol, action, current_price):
+    def execute_trade(self, symbol, action, current_price, confidence=0.0):
         """
         Action Map: 0=Hold, 1=Buy, 2=Sell
         """
@@ -310,13 +335,45 @@ class MultiModalTrader:
                 # Slots remaining
                 slots_left = self.config.MAX_POSITIONS - len(my_positions)
                 
-                # Calculate allocation
+                # Calculate Base Allocation
                 if slots_left > 0:
-                    target_val = cash / slots_left
+                    base_val = cash / slots_left
                 else:
-                    target_val = 0 # Should be caught by max positions check
+                    base_val = 0
                 
-                # Cap at 95% of cash
+                # --- SMART SIZING LOGIC ---
+                # 1. Confidence Scaling (High Conviction = Bigger Size)
+                # Map 0.5->1.0 to 0.8->1.5 multiplier
+                conf_multiplier = 1.0 + (confidence - 0.6)
+                conf_multiplier = max(0.75, min(conf_multiplier, 1.4))
+
+                # 2. Volatility Scaling (Risk Parity - Buy Less of Volatile Assets)
+                atr_multiplier = 1.0
+                try:
+                    df = self.pipeline._load_local_csv(symbol)
+                    if not df.empty and len(df) > 15:
+                        # Simple ATR Calculation
+                        high = df['High']
+                        low = df['Low']
+                        close = df['Close']
+                        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+                        atr = tr.rolling(14).mean().iloc[-1]
+                        
+                        vol_pct = atr / current_price if current_price > 0 else 0
+                        if vol_pct > 0:
+                            # Target 2% daily volatility risk
+                            # If stock moves 4% a day, buy 0.5x
+                            # If stock moves 1% a day, buy 2.0x (capped)
+                            atr_multiplier = 0.02 / vol_pct
+                            atr_multiplier = max(0.6, min(atr_multiplier, 1.3)) # Conservative Caps
+                except:
+                    pass
+
+                print(f"   ⚖️ Sizing: Base=${base_val:.0f} x Conf({conf_multiplier:.2f}) x Vol({atr_multiplier:.2f})")
+                
+                target_val = base_val * conf_multiplier * atr_multiplier
+                
+                # Global Safety Cap (Don't exceed 1.5x base or 95% of cash)
                 target_val = min(target_val, cash * 0.95)
 
                 if target_val < 10.0:
@@ -360,19 +417,37 @@ class MultiModalTrader:
                 
             elif action == 2:  # SELL
                 if not has_position:
-                    print(f"   ⚠️ {symbol}: No position to SELL.")
+                    # Debug noise reduction: only print if we actually thought we had it
+                    # print(f"   ⚠️ {symbol}: No position to SELL.")
                     return
                 
-                # PDT Protection
+                # PDT Protection (Enhanced)
+                confirmed_pdt_risk = False
                 if self.pdt_protection and symbol in self.buy_times:
                     buy_time = self.buy_times[symbol]
                     hold_duration = datetime.now() - buy_time
-                    min_hold = timedelta(hours=self.min_hold_hours)
+                    min_hold = timedelta(hours=self.min_hold_hours) # 24h
+                    
                     if hold_duration < min_hold:
-                        remaining = min_hold - hold_duration
-                        print(f"   🛡️ PDT Protection: {symbol} must be held {remaining.seconds//3600}h {(remaining.seconds%3600)//60}m more. Skipping SELL.")
-                        return
-                
+                        # Potential Day Trade
+                        try: 
+                            # Check account status for Day Trade Count
+                            account = self.api.get_account()
+                            # pattern_day_trader is boolean. daytrade_count is int.
+                            # Standard rule: < 25k eq implies potential PDT restriction if daytrade_count >= 3
+                            is_under_25k = float(account.equity) < 25000
+                            dt_count = int(account.daytrade_count)
+
+                            if (account.pattern_day_trader or is_under_25k) and dt_count >= 3:
+                                remaining = min_hold - hold_duration
+                                print(f"   🛡️ PDT Protection: Holding {symbol} (Bought {hold_duration.seconds//3600}h ago). DT Count: {dt_count}/3. Skipping SELL to avoid violation.")
+                                return
+                            else:
+                                print(f"   ⚠️ Day Trade Warning: Selling {symbol} < 24h hold. DT Count: {dt_count}/3.")
+                        except Exception as e:
+                            print(f"   ⚠️ PDT Check Failed ({e}). Defaulting to SAFE mode (Hold).")
+                            return
+
                 print(f"   🔻 {symbol}: SELL {qty_held} @ ${current_price:.2f}")
                 self.api.submit_order(
                     symbol=symbol,
@@ -411,6 +486,32 @@ class MultiModalTrader:
             print(f"✅ All {target_asset_class} positions liquidated.")
         except Exception as e:
             print(f"❌ Error liquidating positions: {e}")
+
+    def _restore_buy_times(self):
+        """Restores buy times from today's filled orders to populate PDT protection cache."""
+        try:
+            print("   🔄 Restoring buy times from API to sync PDT protection...")
+            # Fetch orders from last 24h to cover the trading day
+            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            orders = self.api.list_orders(status='filled', after=yesterday, direction='asc')
+            
+            restored_count = 0
+            for o in orders:
+                if o.side == 'buy':
+                    # Parse timestamp (handle timezone awareness)
+                    # Convert to standard python datetime to use safe astimezone() defaults (local system time)
+                    filled_at = pd.to_datetime(o.filled_at).to_pydatetime()
+                    
+                    if filled_at.tzinfo is not None:
+                         # Convert to system local time (naive) for comparison with datetime.now()
+                         filled_at = filled_at.astimezone().replace(tzinfo=None)
+                    
+                    self.buy_times[o.symbol] = filled_at
+                    restored_count += 1
+            
+            print(f"   ✅ Restored {restored_count} buy timestamps for PDT logic.")
+        except Exception as e:
+            print(f"   ⚠️ Failed to restore buy times: {e}")
 
     def _calculate_atr_trailing_stop(self, df, atr_period=14, multiplier=3.0):
         """
@@ -477,6 +578,12 @@ class MultiModalTrader:
                         time.sleep(sleep_time)
                         
                         # WAKE UP (Beginning of Day)
+                        print("🌅 Waking up for Market Open!")
+                        
+                        # Update Data for the new day (Swing Mode)
+                        if self.mode == 'swing':
+                             self._update_historical_data()
+                             
                         # If Day Trader, ensure we start flat
                         if self.mode == 'day':
                             print("☀️ Market Opening Soon! Checking for stale positions...")
@@ -512,9 +619,42 @@ class MultiModalTrader:
             # --- RANKING LOGIC START ---
             scored_opportunities = [] 
             
-            print(f"🔍 Scanning {len(self.symbols)} symbols for RANKING (Split Phase)...")
+            print(f"🔍 Scanning {len(self.symbols)} symbols for RANKING...")
+
+            # --- PRE-SCAN: FETCH LIVE MARKET SNAPSHOTS (Optimized) ---
+            if self.mode != 'crypto': # Stocks only
+                try:
+                    # Chunks of 1000 (Alpaca Limit)
+                    chunk_size = 500
+                    chunks = [self.symbols[i:i + chunk_size] for i in range(0, len(self.symbols), chunk_size)]
+                    
+                    self.pipeline.live_daily_candles = {} # Clear prev cache
+                    
+                    sys_today = datetime.now().date()
+                    
+                    for chunk in chunks:
+                        # get_snapshots map: symbol -> details
+                        # We use 'latest_trade' or 'daily_bar'? Daily bar is better for Open/High/Low info.
+                        # Alpaca daily_bar usually means "Current Day data (rolling)"
+                        snapshots = self.api.get_snapshots(chunk)
+                        
+                        for sym, snap in snapshots.items():
+                             if snap and snap.daily_bar:
+                                 # Convert to simple dict
+                                 self.pipeline.live_daily_candles[sym] = {
+                                     'date': snap.daily_bar.t, # Timestamp
+                                     'open': snap.daily_bar.o,
+                                     'high': snap.daily_bar.h,
+                                     'low': snap.daily_bar.l,
+                                     'close': snap.daily_bar.c,
+                                     'volume': snap.daily_bar.v
+                                 }
+                    
+                    print(f"   📡 Injected {len(self.pipeline.live_daily_candles)} live candles for today.")
+                except Exception as e:
+                    print(f"   ⚠️ Snapshots fetch failed: {e}. Using cached CSV data only.")
             
-            # --- PHASE 1: PARALLEL DATA FETCHING (I/O BOUND) ---
+            # --- PHASE 1: DATA FETCHING ---
             fetch_start = time.time()
             data_results = []
             
@@ -538,7 +678,7 @@ class MultiModalTrader:
                 except Exception:
                     return None
 
-            # 20 Workers for Swing, 5 for others
+            # Parallel execution is safe + fast now that we use local CSVs for swing
             workers = 20 if self.mode == 'swing' else 5 
             
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -567,6 +707,20 @@ class MultiModalTrader:
                 try:
                     # Agent Act
                     action, confidence = self.agent.act(ts_state, text_ids, text_mask, eval_mode=True, return_q=True)
+                    
+                    # DEBUG: Sample check (log first 3 symbols' input ranges)
+                    debug_count = getattr(self, '_debug_count', 0)
+                    if debug_count < 3:
+                        ts_min, ts_max, ts_mean = float(ts_state.min()), float(ts_state.max()), float(ts_state.mean())
+                        
+                        # Fetch headlines from cache for verification display
+                        cached_headlines = self.pipeline.news_fetcher.get_headlines(symbol, limit=1)
+                        top_news = cached_headlines[0][:60] + "..." if cached_headlines else "No News"
+                        
+                        print(f"   🔍 Debug [{debug_count}] {symbol}: TS=[{ts_min:.2f}, {ts_max:.2f}], Action={action}, Conf={confidence:.3f}")
+                        print(f"      📰 News Input: \"{top_news}\"")
+                        
+                        self._debug_count = debug_count + 1
                     
                     # --- FILTERS ---
                     # --- SWING TRADER: NATURAL TRAILING STOP (Chandelier Exit) ---
@@ -617,12 +771,41 @@ class MultiModalTrader:
             # actions: 0=HOLD, 1=BUY, 2=SELL.
             # We separate them.
             
-            buys = [x for x in scored_opportunities if x['action'] == 1]
-            sells = [x for x in scored_opportunities if x['action'] == 2]
+            buys = [x for x in scored_opportunities if x['action'] == 1 and x['confidence'] > 0.40]
+            # CRITICAL: Only treat as SELL if confidence is HIGH (model is certain about exit)
+            # Avoid selling on weak signals which are just neutral HOLDS
+            sells = [x for x in scored_opportunities if x['action'] == 2 and x['confidence'] > 0.40]
+            
+            # Debug: Log filtered SELL count
+            sells_raw = [x for x in scored_opportunities if x['action'] == 2]
+            if sells_raw and len(sells) < len(sells_raw):
+                filtered_out = len(sells_raw) - len(sells)
+                print(f"   🔇 Filtered out {filtered_out} weak SELL signals (low confidence).")
+            
+            # DEBUG: Check confidence distribution
+            if scored_opportunities:
+                confs = [x['confidence'] for x in scored_opportunities]
+                print(f"   📊 Confidence Stats: Min={min(confs):.3f}, Max={max(confs):.3f}, Mean={np.mean(confs):.3f}")
             
             # Sort BUYs by confidence (Higher Q-value = Better)
             buys.sort(key=lambda x: x['confidence'], reverse=True)
             
+            # --- SNIPER MODE: Hard Filter for Top K ---
+            # Determine slots available (Approximation using cached state)
+            target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
+            current_holdings = len([p for p in self.cached_positions if getattr(p, 'asset_class', 'us_equity') == target_asset_class])
+            slots_left = max(0, self.config.MAX_POSITIONS - current_holdings)
+
+            # Filter buys list to match available slots (Sniper Mode)
+            if buys and slots_left < len(buys):
+                # Print info before cutting
+                if slots_left > 0:
+                     print(f"   ✂️ Sniper Mode: Limiting {len(buys)} candidates to Top {slots_left} available slots...")
+                     buys = buys[:slots_left]
+                else:
+                     print(f"   ⚠️ Max Positions Full ({current_holdings}/{self.config.MAX_POSITIONS}). Ignoring all {len(buys)} buy signals.")
+                     buys = []
+
             if buys:
                 print(f"\n📊 TOP RANKED BUY OPPORTUNITIES (Execution Optimization Active):")
                 for i, item in enumerate(buys[:10]):
@@ -631,13 +814,16 @@ class MultiModalTrader:
             
             # Execute SELLs first (Free up cash)
             for item in sells:
-                print(f"📉 Executing SELL for {item['symbol']} (Conf: {item['confidence']:.2f})")
-                self.execute_trade(item['symbol'], 2, item['price'])
+                # Check if we hold it BEFORE printing "Executing SELL" to avoid confusing logs
+                positions_dict = {p.symbol: p for p in self.cached_positions}
+                if item['symbol'] in positions_dict:
+                     print(f"📉 Executing SELL for {item['symbol']} (Conf: {item['confidence']:.2f})")
+                     self.execute_trade(item['symbol'], 2, item['price'], confidence=item['confidence'])
                 
             # Execute BUYs (Top N)
             for item in buys:
                 print(f"📈 Executing BUY for {item['symbol']} (Conf: {item['confidence']:.2f})")
-                self.execute_trade(item['symbol'], 1, item['price'])
+                self.execute_trade(item['symbol'], 1, item['price'], confidence=item['confidence'])
 
             # Sleep
             sleep_time = 30 if self.mode == 'day' else 60

@@ -66,15 +66,17 @@ class MoneyScraperConfig:
 
 class SwingTraderConfig:
     """Multi-day swing trader settings"""
-    MAX_POSITIONS = 20
+    MAX_POSITIONS = 10
     SCAN_INTERVAL_MINUTES = int(os.getenv("SWING_SCAN_INTERVAL_MINUTES", "5"))
     USE_WEBSOCKET = False
     WATCHLIST = "my_portfolio.txt"
     # Tuned exits (Phase 2): mandatory ATR trailing stop + ATR profit-take
-    # Increased to 6.0 for Episode 330 "Aggressive Update" Model (Catastrophe Insurance only)
+    # User Preference: Reverted to 6.0 based on Backtest (Allows for volatility)
+    # Note: With $5k acct, this allows deeper drawdowns but stays true to the model.
     STOP_ATR_MULT = 6.0
     TRAILING_ATR_MULT = 6.0
-    PROFIT_ATR_MULT = 3.0
+    # kept Profit at 4.0 to encourage holding winners, but we can revert to 3.0 if strictly following backtest
+    PROFIT_ATR_MULT = 3.0 
     LIQUIDATE_EOD = False
     ONLINE_LEARNING = True
     EXPLORATION_EPSILON = 0.03  # 3% exploration for swing trades
@@ -114,7 +116,7 @@ class CryptoTraderConfig:
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
 # Specialized Model Paths (Option A Architecture)
-SWING_MODEL_PATH = MODEL_DIR / "swing_gen6_finetune_aggressive_update_ep330_balanced.pth"  # Aggressive Update Ep 330 (Record High Profit)
+SWING_MODEL_PATH = MODEL_DIR / "ensemble_ep200"  # EP200 Ensemble - 83% backtest return
 SCALPER_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Day
 SHARED_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Crypto
 REPLAY_BUFFER_PATH = MODEL_DIR / "replay_buffer.pkl"
@@ -130,6 +132,21 @@ class TrainingConfig:
     NUM_WINDOW_FEATURES = 11
     NUM_REGIME_FEATURES = 6
     NUM_PORTFOLIO_FEATURES = 5
+    
+    # === LIVE TRADING ALIGNMENT ===
+    # These match SwingTraderConfig for consistent training/deployment
+    MAX_POSITIONS = 10
+    STOP_ATR_MULT = 6.0       # Stop loss at 6x ATR
+    PROFIT_ATR_MULT = 3.0     # Take profit at 3x ATR 
+    CONFIDENCE_THRESHOLD = 0.40  # Only take trades with >40% softmax confidence
+    
+    # Enable ATR-based stops during training (matches live trading)
+    USE_TRAILING_STOP = True
+    TRAILING_STOP_ATR_MULT = 6.0  # Same as STOP_ATR_MULT
+    USE_PROFIT_TAKE = True
+    PROFIT_TAKE_ATR_MULT = 3.0    # Same as PROFIT_ATR_MULT
+    ATR_WINDOW = 14
+    
     # Execution realism (basis points)
     # 7 bps transaction cost + 3 bps slippage = 10 bps total (0.10%) per trade
     # This discourages frivolous trading and encourages meaningful entries/exits
@@ -140,6 +157,18 @@ class TrainingConfig:
     EXIT_PROFIT_BONUS = float(os.getenv("EXIT_PROFIT_BONUS", "0.001"))  # Bonus for profitable exits
     HOLDING_LOSS_PENALTY = float(os.getenv("HOLDING_LOSS_PENALTY", "0.0001"))  # Penalty per step holding a loser
     LOSS_THRESHOLD_PCT = float(os.getenv("LOSS_THRESHOLD_PCT", "0.02"))  # -2% triggers holding penalty
+    
+    # === REGIME-AWARE REWARD SHAPING ===
+    # Instead of oversampling bear markets (which 3x slows training), we give
+    # bonus rewards for correct actions during downtrends. This teaches the model
+    # to handle bear markets without increasing training data size.
+    REGIME_REWARD_MULT = 2.0     # Multiplier for bear market rewards
+    TREND_LOOKBACK = 20          # Days to detect downtrend (price < 95% of lookback price)
+    
+    # Reward scaling for better Q-value spread
+    # Log-returns are tiny (-0.001 to +0.001). Scale to (-0.1 to +0.1) for better gradients.
+    REWARD_SCALE = 100.0
+    
     GAMMA = 0.999  # Increased from 0.99 for long-term focus
     LEARNING_RATE = 0.0001
     BATCH_SIZE = 512

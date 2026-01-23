@@ -33,6 +33,13 @@ class EnsembleAgent:
         
         self.agents = [self.aggressive, self.conservative, self.balanced]
 
+    def set_eval(self):
+        """Set all agents to evaluation mode (disable dropout/batchnorm updates)."""
+        for agent in self.agents:
+            agent.policy_net.eval()
+            agent.target_net.eval()
+            agent.epsilon = 0.0 # Disable exploration
+
     def act(self, ts_state, text_ids, text_mask, eval_mode=False, return_q=False):
         """
         Voting Mechanism:
@@ -61,33 +68,91 @@ class EnsembleAgent:
         if text_mask.dim() == 1:
             text_mask = text_mask.unsqueeze(0)
 
-        votes = []
-        q_sums = np.zeros(self.action_dim)
+        # Prepare voting
+        batch_size = ts_state.shape[0]
+        votes = torch.zeros((batch_size, 3), dtype=torch.long, device=self.device)
+        weights = torch.ones((batch_size, 3), device=self.device)
         
-        with torch.inference_mode():
-             for agent in self.agents:
-                # Forward pass
-                q_vals_tensor = agent.policy_net(ts_state, text_ids, text_mask)
-                q_vals = q_vals_tensor.squeeze(0) # Remove batch dim -> (Action_Dim)
-                
-                action = torch.argmax(q_vals).item()
-                votes.append(action)
-                q_sums += q_vals.cpu().numpy()
+        # Accumulate Q-values for relative confidence
+        q_sums = np.zeros((batch_size, self.action_dim))
+        
+        for i, agent in enumerate(self.agents):
+            # Each agent returns action - PASS eval_mode to prevent random exploration
+            actions, q_vals = agent.act(ts_state, text_ids, text_mask, eval_mode=eval_mode, return_q=True)
+            
+            # Handle tensor vs scalar actions
+            if isinstance(actions, int):
+                actions = torch.tensor([actions], device=self.device)
+            elif not isinstance(actions, torch.Tensor):
+                actions = torch.tensor(actions, device=self.device)
+            
+            votes[:, i] = actions
+            
+            # Handle None q_vals (from random exploration fallback)
+            if q_vals is not None:
+                if isinstance(q_vals, torch.Tensor):
+                    q_sums += q_vals.cpu().numpy()
+                else:
+                    q_sums += np.array(q_vals)
+            
+            # Weight 'Balanced' agent slightly higher in disagreement?
+            if i == 2: 
+                weights[:, i] = 1.1
 
-        # Majority Vote
-        counts = np.bincount(votes, minlength=self.action_dim)
-        if np.max(counts) >= 2:
-            final_action = np.argmax(counts)
-        else:
-            # Tie-breaker: Balanced Agent
-            final_action = votes[2]
-            
+        # Calculate Majority Vote
+        # Vectorized One-Hot Encoding and Summing
+        vote_counts = torch.zeros((batch_size, self.action_dim), device=self.device)
+        vote_counts.scatter_add_(1, votes, weights)
+        
+        max_w, argmax = vote_counts.max(dim=1)
+
+        # Special SELL preference rule
+        cons_sell = votes[:, 1] == 2
+        other_not_buy = (votes[:, 0] != 1) | (votes[:, 2] != 1)
+        force_sell = cons_sell & other_not_buy
+
+        # Default: Majority Vote
+        final_actions = argmax
+        
+        # Tie-breaker logic (if weights sum to equal max? with floats heavily unlikely)
+        # But let's check for strong confidence or force sell
+        
+        confident = max_w >= 1.5
+        # If not confident, maybe fallback to balanced? 
+        # But weighted majority handles this implicitly if balanced has 1.1 weight.
+        
+        final_actions[force_sell] = 2
+
         if return_q:
-            # Return Q-value average of the chosen action to represent "Confidence"
-            avg_q = q_sums[final_action] / 3.0
-            return final_action, avg_q
+            # Vectorized Confidence using SOFTMAX
+            # q_avgs = q_sums / 3.0 (Batch, Actions)
+            q_avgs = q_sums / 3.0
             
-        return final_action
+            row_indices = np.arange(batch_size)
+            final_actions_np = final_actions.cpu().numpy()
+            
+            # Apply softmax with temperature to get proper probabilities
+            # Temperature controls sharpness: lower = sharper distribution
+            # Model Q-values are tightly clustered (~0.8% spread), so use very low temp
+            temperature = 0.01  # Very low to amplify tiny differences
+            q_scaled = q_avgs / temperature
+            
+            # Softmax: exp(q) / sum(exp(q))
+            q_exp = np.exp(q_scaled - np.max(q_scaled, axis=1, keepdims=True))  # Numerical stability
+            softmax_probs = q_exp / np.sum(q_exp, axis=1, keepdims=True)
+            
+            # Confidence = probability of chosen action (0 to 1)
+            confidence = softmax_probs[row_indices, final_actions_np]
+            
+            # Return scalar for single sample, array for batch
+            if batch_size == 1:
+                return final_actions[0].item(), float(confidence[0])
+            return final_actions, confidence
+            
+        # Return scalar for single sample
+        if batch_size == 1:
+            return final_actions[0].item()
+        return final_actions
 
     def batch_act(self, ts_state, text_ids, text_mask, in_position=None, sell_bias=0.15):
         """
@@ -209,7 +274,13 @@ class EnsembleAgent:
             self.aggressive.policy_net.load_state_dict(agg_sd)
             self.conservative.policy_net.load_state_dict(con_sd)
             self.balanced.policy_net.load_state_dict(bal_sd)
-            print("✅ Ensemble weights loaded successfully.")
+            
+            # FORCE EVAL MODE TO DISABLE DROPOUT (Fixes Signal Jitter)
+            self.aggressive.policy_net.eval()
+            self.conservative.policy_net.eval()
+            self.balanced.policy_net.eval()
+            
+            print("✅ Ensemble weights loaded successfully (Dropout DISABLED).")
         except FileNotFoundError:
             print("⚠️ Ensemble weights not found. Starting fresh.")
 

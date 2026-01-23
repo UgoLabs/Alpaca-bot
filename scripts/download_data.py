@@ -17,13 +17,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = "data/historical_swing"
 TIMEFRAME = "1d" 
 PERIOD = "10y"
-SYMBOLS_FILE = "config/watchlists/my_portfolio.txt"
+DEFAULT_SYMBOLS_FILE = "config/watchlists/my_portfolio.txt"
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-def download_data():
+def download_data(watchlist_path=None):
+    symbols_file = watchlist_path if watchlist_path else DEFAULT_SYMBOLS_FILE
+    
     print(f"🚀 Initializing Massive Data Download Strategy (yfinance)")
     print(f"📂 Target: {os.path.abspath(DATA_DIR)}")
     print(f"⏱️  Timeframe: {TIMEFRAME}")
@@ -33,13 +35,13 @@ def download_data():
     
     # Load Symbols
     try:
-        with open(SYMBOLS_FILE, 'r') as f:
+        with open(symbols_file, 'r') as f:
             symbols = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     except FileNotFoundError:
-        print(f"❌ Could not find {SYMBOLS_FILE}")
+        print(f"❌ Could not find {symbols_file}")
         return
 
-    print(f"📋 Found {len(symbols)} symbols to archive.")
+    print(f"📋 Found {len(symbols)} symbols in {symbols_file} to archive.")
     
     def download_symbol(symbol):
         try:
@@ -66,9 +68,9 @@ def download_data():
         except Exception as e:
             return f"Error {symbol}: {e}"
 
-    print(f"🚀 Initializing Parallel Download (20 Workers)")
+    print(f"🚀 Initializing Parallel Download (4 Workers)")
     
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(download_symbol, sym): sym for sym in symbols}
         
         for future in tqdm(as_completed(futures), total=len(symbols), desc="Downloading"):
@@ -77,4 +79,8 @@ def download_data():
     print("\n✅ Download Complete.")
 
 if __name__ == "__main__":
-    download_data()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watchlist", type=str, help="Path to watchlist file", default=None)
+    args = parser.parse_args()
+    
+    download_data(args.watchlist)
