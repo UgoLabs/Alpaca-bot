@@ -71,11 +71,13 @@ class MultiModalAgent(nn.Module):
         # For cleaner code, let's just call the encoder directly here.
         
         # TS Head Forward Logic (Replicated from TransformerDQN for flexibility)
-        x_ts = ts_data.permute(1, 0, 2) # (Seq, Batch, Feat)
-        x_ts = self.ts_head.embedding(x_ts) * torch.sqrt(torch.tensor(self.ts_head.d_model, device=ts_data.device))
+        # Using Batch First (Batch, Window, Feat)
+        x_ts = self.ts_head.embedding(ts_data) * torch.sqrt(torch.tensor(self.ts_head.d_model, device=ts_data.device))
         x_ts = self.ts_head.pos_encoder(x_ts)
         ts_out = self.ts_head.transformer_encoder(x_ts)
-        ts_emb = ts_out[-1, :, :] # (Batch, d_model)
+        
+        # Take the output of the LAST time step
+        ts_emb = ts_out[:, -1, :] # (Batch, d_model)
         
         # 2. Get Vision Embedding
         vision_emb = self.vision_head(ts_data) # (Batch, d_model)

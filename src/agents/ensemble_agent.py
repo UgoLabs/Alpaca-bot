@@ -280,9 +280,9 @@ class EnsembleAgent:
             self.conservative.policy_net.eval()
             self.balanced.policy_net.eval()
             
-            print("✅ Ensemble weights loaded successfully (Dropout DISABLED).")
+            print("[SUCCESS] Ensemble weights loaded successfully (Dropout DISABLED).")
         except FileNotFoundError:
-            print("⚠️ Ensemble weights not found. Starting fresh.")
+            print("Ensemble weights not found. Starting fresh.")
 
     def freeze_feature_extractors(self):
         for agent in self.agents:

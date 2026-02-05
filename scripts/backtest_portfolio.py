@@ -15,7 +15,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.agents.ensemble_agent import EnsembleAgent
 from src.core.indicators import add_technical_indicators
 
-def load_aligned_data(data_dir, start_date=None, end_date=None):
+FEATURES_25 = [
+    'sma_10', 'sma_20', 'sma_50', 'sma_200', 'atr', 'bb_width', 'bb_upper', 'bb_lower',
+    'ema_12', 'ema_26', 'macd', 'macd_signal', 'macd_diff', 'adx', 'rsi',
+    'stoch_k', 'stoch_d', 'williams_r', 'roc', 'bb_pband', 'volume_sma',
+    'volume_ratio', 'obv', 'mfi', 'price_vs_sma20'
+]
+FEATURES_11 = ['Open', 'High', 'Low', 'Close', 'Volume', 'rsi', 'macd', 'macd_signal', 'adx', 'sma_20', 'ema_12']
+
+def load_aligned_data(data_dir, start_date=None, end_date=None, feature_cols=None):
     """
     Loads all CSVs and aligns them to a common date index.
     Returns:
@@ -71,8 +79,9 @@ def load_aligned_data(data_dir, start_date=None, end_date=None):
             df = add_technical_indicators(df)
             df = df.replace([np.inf, -np.inf], np.nan).dropna()
             
-            # Feature Columns check
-            feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'rsi', 'macd', 'macd_signal', 'adx', 'sma_20', 'ema_12']
+            # Use provided feature columns
+            if feature_cols is None:
+                feature_cols = FEATURES_25
             missing = [c for c in feature_cols if c not in df.columns]
             if missing:
                 # Debug only first few failures
@@ -119,18 +128,27 @@ def run_portfolio_backtest(
     print(f"🚀 Portfolio Backtest | Device: {device} | Model: {os.path.basename(model_path)}")
     print(f"⚙️  Settings: Max Pos={max_positions} | Stop={stop_atr_mult}x | Profit={profit_atr_mult}x | Conf Threshold={confidence_threshold}")
     
-    # Load Dummy Data to init agent size
-    agent = EnsembleAgent(time_series_dim=11, vision_channels=11, action_dim=3, device=device)
-    # model_path should be the prefix like "models/ensemble_ep200" (without _balanced.pth etc)
-    # If user passes full path, strip the suffix
+    # Auto-detect feature size from model name
     import re
     model_prefix = re.sub(r'_(aggressive|balanced|conservative)\.pth$', '', model_path)
-    model_prefix = model_prefix.replace('.pth', '')  # fallback if no suffix match
+    model_prefix = model_prefix.replace('.pth', '')
+    
+    # Detect if swing/ensemble model (11 features) or sharpe model (25 features)
+    if 'swing' in model_prefix.lower() or 'ensemble' in model_prefix.lower():
+        num_features = 11
+        feature_cols = FEATURES_11
+        print(f"🔍 Detected SWING/ENSEMBLE model → 11 features")
+    else:
+        num_features = 25
+        feature_cols = FEATURES_25
+        print(f"🔍 Detected SHARPE model → 25 features")
+    
+    agent = EnsembleAgent(time_series_dim=num_features, vision_channels=num_features, action_dim=3, device=device)
     agent.load(model_prefix)
     agent.set_eval()
     
     # 2. Load Data
-    market_data, valid_dates = load_aligned_data(data_dir, start_date, end_date)
+    market_data, valid_dates = load_aligned_data(data_dir, start_date, end_date, feature_cols)
     
     # 3. Simulation State
     cash = initial_cash
@@ -365,6 +383,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("model", help="Path to model file")
     parser.add_argument("--start", default="2024-01-01", help="Start Date")
+    parser.add_argument("--end", default=None, help="End Date")
+    parser.add_argument("--balance", type=float, default=10000.0, help="Initial Cash Balance")
+    parser.add_argument("--max-pos", type=int, default=10, help="Max Concurrent Positions")
+    parser.add_argument("--thresh", type=float, default=0.40, help="Confidence Threshold (default: 0.40)")
+    parser.add_argument("--stop", type=float, default=6.0, help="Stop Loss ATR Multiplier")
+    parser.add_argument("--profit", type=float, default=3.0, help="Take Profit ATR Multiplier")
     args = parser.parse_args()
     
-    run_portfolio_backtest(args.model, start_date=args.start)
+    run_portfolio_backtest(
+        args.model, 
+        start_date=args.start, 
+        end_date=args.end,
+        initial_cash=args.balance, 
+        max_positions=args.max_pos,
+        confidence_threshold=args.thresh,
+        stop_atr_mult=args.stop,
+        profit_atr_mult=args.profit
+    )

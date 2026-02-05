@@ -97,13 +97,24 @@ class MultiModalTrader:
             elif "_conservative.pth" in model_path:
                 prefix = model_path.replace("_conservative.pth", "")
             
-            if os.path.exists(f"{prefix}_balanced.pth"):
+            target_file = f"{prefix}_balanced.pth"
+            if os.path.exists(target_file):
                 print(f"📂 Loading Configured Model: {prefix}...")
                 self.agent.load(prefix)
                 loaded = True
+            else:
+                # STRICT MODE: If a specific model is configured but missing, DO NOT FALL BACK.
+                # This prevents accidentally loading an older, inferior model (e.g. Ep200 instead of Ep350)
+                raise FileNotFoundError(
+                    f"\n❌ CRITICAL: The configured model was not found!\n"
+                    f"   Expected: {target_file}\n"
+                    f"   Action: Aborting startup to prevent loading wrong model.\n"
+                    f"   Fix: Check SWING_MODEL_PATH in config/settings.py"
+                )
         
         if not loaded:
-            # Fallback to auto-discovery
+            # Fallback to auto-discovery ONLY if no model path was configured
+            print("⚠️ No model path configured in settings. Attempting auto-discovery...")
             import glob
             checkpoints = glob.glob("models/ensemble_ep*_balanced.pth")
             if checkpoints:
@@ -187,6 +198,7 @@ class MultiModalTrader:
             account = self.api.get_account()
             self.cached_cash = float(account.cash)
             self.cached_buying_power = float(account.buying_power)
+            self.cached_equity = float(account.equity)
             
             # Print Summary
             print(f"\n💰 Equity: ${float(account.equity):.2f} | Cash: ${self.cached_cash:.2f} | BP: ${self.cached_buying_power:.2f}")
@@ -328,63 +340,27 @@ class MultiModalTrader:
                     print(f"   ⚠️ Max positions reached ({len(my_positions)}/{self.config.MAX_POSITIONS}) for {target_asset_class}. Skipping BUY.")
                     return
 
-                # 2. Dynamic Position Sizing (Use Buying Power for Margin Support)
-                # Was: cash = self.cached_cash (Too conservative for margin accounts)
-                cash = self.cached_buying_power
+                # 2. Fixed Percentage Position Sizing (Fixed 5% of TOTAL CAPACITY)
+                # MODIFIED: Use (Equity * 0.95) as base to strictly avoid Margin Usage.
+                # Target: 20 positions = ~5% of Equity per position.
+                total_capacity = float(self.cached_equity) * 0.95
+                target_val = total_capacity * 0.05 # 5% of Capacity = 1/20th of Portfolio
                 
-                # Slots remaining
-                slots_left = self.config.MAX_POSITIONS - len(my_positions)
+                # Cap at Available BP (Can't spend what we don't have)
+                target_val = min(target_val, float(self.cached_buying_power))
                 
-                # Calculate Base Allocation
-                if slots_left > 0:
-                    base_val = cash / slots_left
-                else:
-                    base_val = 0
+                # SAFETY CAP: Never exceed 20% of Equity in one single trade (Sanity check)
+                safety_cap = float(self.cached_equity) * 0.20
+                target_val = min(target_val, safety_cap)
                 
-                # --- SMART SIZING LOGIC ---
-                # 1. Confidence Scaling (High Conviction = Bigger Size)
-                # Map 0.5->1.0 to 0.8->1.5 multiplier
-                conf_multiplier = 1.0 + (confidence - 0.6)
-                conf_multiplier = max(0.75, min(conf_multiplier, 1.4))
-
-                # 2. Volatility Scaling (Risk Parity - Buy Less of Volatile Assets)
-                atr_multiplier = 1.0
-                try:
-                    df = self.pipeline._load_local_csv(symbol)
-                    if not df.empty and len(df) > 15:
-                        # Simple ATR Calculation
-                        high = df['High']
-                        low = df['Low']
-                        close = df['Close']
-                        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-                        atr = tr.rolling(14).mean().iloc[-1]
-                        
-                        vol_pct = atr / current_price if current_price > 0 else 0
-                        if vol_pct > 0:
-                            # Target 2% daily volatility risk
-                            # If stock moves 4% a day, buy 0.5x
-                            # If stock moves 1% a day, buy 2.0x (capped)
-                            atr_multiplier = 0.02 / vol_pct
-                            atr_multiplier = max(0.6, min(atr_multiplier, 1.3)) # Conservative Caps
-                except:
-                    pass
-
-                print(f"   ⚖️ Sizing: Base=${base_val:.0f} x Conf({conf_multiplier:.2f}) x Vol({atr_multiplier:.2f})")
-                
-                target_val = base_val * conf_multiplier * atr_multiplier
-                
-                # Global Safety Cap (Don't exceed 1.5x base or 95% of cash)
-                target_val = min(target_val, cash * 0.95)
-
                 if target_val < 10.0:
-                    print(f"   ⚠️ Insufficient cash (${cash:.2f}) for {symbol} (Allocated: ${target_val:.2f}). Skipping.")
+                    print(f"   ⚠️ Insufficient Size (${target_val:.2f}). Skipping.")
                     return
 
                 # Calculate Quantity
                 if current_price > 0:
                     qty = target_val / current_price
                 else:
-                    print(f"   ❌ Invalid price ${current_price}")
                     return
 
                 # Rounding
@@ -460,9 +436,15 @@ class MultiModalTrader:
                 # Optimistic Update
                 self.cached_cash += (qty_held * current_price)
                 self.cached_positions = [p for p in self.cached_positions if p.symbol != symbol]
+                return True  # Success
                 
         except Exception as e:
+            error_msg = str(e).lower()
             print(f"   ❌ Order Failed: {e}")
+            # Return special code for insufficient buying power
+            if 'insufficient' in error_msg or 'buying power' in error_msg:
+                return 'NO_BP'
+            return False
 
 
     def liquidate_all_positions(self):
@@ -624,33 +606,44 @@ class MultiModalTrader:
             # --- PRE-SCAN: FETCH LIVE MARKET SNAPSHOTS (Optimized) ---
             if self.mode != 'crypto': # Stocks only
                 try:
-                    # Chunks of 1000 (Alpaca Limit)
-                    chunk_size = 500
+                    # Chunks of 100 for stability (prevent long URL / Timeouts)
+                    chunk_size = 100
                     chunks = [self.symbols[i:i + chunk_size] for i in range(0, len(self.symbols), chunk_size)]
                     
                     self.pipeline.live_daily_candles = {} # Clear prev cache
                     
                     sys_today = datetime.now().date()
                     
-                    for chunk in chunks:
-                        # get_snapshots map: symbol -> details
-                        # We use 'latest_trade' or 'daily_bar'? Daily bar is better for Open/High/Low info.
-                        # Alpaca daily_bar usually means "Current Day data (rolling)"
-                        snapshots = self.api.get_snapshots(chunk)
-                        
-                        for sym, snap in snapshots.items():
-                             if snap and snap.daily_bar:
-                                 # Convert to simple dict
-                                 self.pipeline.live_daily_candles[sym] = {
-                                     'date': snap.daily_bar.t, # Timestamp
-                                     'open': snap.daily_bar.o,
-                                     'high': snap.daily_bar.h,
-                                     'low': snap.daily_bar.l,
-                                     'close': snap.daily_bar.c,
-                                     'volume': snap.daily_bar.v
-                                 }
+                    fetched_count = 0
+                    total_chunks = len(chunks)
+                    for i, chunk in enumerate(chunks):
+                        try:
+                            # get_snapshots map: symbol -> details
+                            print(f"   ⏳ Fetching live snapshots chunk {i+1}/{total_chunks} ({len(chunk)} symbols)...")
+                            snapshots = self.api.get_snapshots(chunk)
+                            
+                            for sym, snap in snapshots.items():
+                                 if snap and snap.daily_bar:
+                                     self.pipeline.live_daily_candles[sym] = {
+                                         'date': snap.daily_bar.t,
+                                         'open': snap.daily_bar.o,
+                                         'high': snap.daily_bar.h,
+                                         'low': snap.daily_bar.l,
+                                         'close': snap.daily_bar.c,
+                                         'volume': snap.daily_bar.v
+                                     }
+                                     fetched_count += 1
+                            
+                            # Small sleep to be nice to API
+                            time.sleep(0.2)
+                            
+                        except Exception as chunk_e:
+                            print(f"   ⚠️ Chunk fetch failed ({len(chunk)} symbols): {chunk_e}")
+                            continue # Try next chunk
                     
-                    print(f"   📡 Injected {len(self.pipeline.live_daily_candles)} live candles for today.")
+                    if fetched_count > 0:
+                        print(f"   📡 Injected {len(self.pipeline.live_daily_candles)} live candles for today.")
+                        
                 except Exception as e:
                     print(f"   ⚠️ Snapshots fetch failed: {e}. Using cached CSV data only.")
             
@@ -679,7 +672,8 @@ class MultiModalTrader:
                     return None
 
             # Parallel execution is safe + fast now that we use local CSVs for swing
-            workers = 20 if self.mode == 'swing' else 5 
+            # Reduced from 20 to 10 to be safe but faster than 4
+            workers = 10 if self.mode == 'swing' else 5 
             
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_symbol = {executor.submit(fetch_symbol_task, sym): sym for sym in self.symbols}
@@ -717,24 +711,25 @@ class MultiModalTrader:
                         cached_headlines = self.pipeline.news_fetcher.get_headlines(symbol, limit=1)
                         top_news = cached_headlines[0][:60] + "..." if cached_headlines else "No News"
                         
-                        print(f"   🔍 Debug [{debug_count}] {symbol}: TS=[{ts_min:.2f}, {ts_max:.2f}], Action={action}, Conf={confidence:.3f}")
+                        print(f"   🔍 Debug [{debug_count}] {symbol}: Price=${current_price:.2f} | TS=[{ts_min:.2f}, {ts_max:.2f}] | Action={action} ({['HOLD','BUY','SELL'][action]}) | Conf={confidence:.3f}")
                         print(f"      📰 News Input: \"{top_news}\"")
                         
                         self._debug_count = debug_count + 1
                     
                     # --- FILTERS ---
-                    # --- SWING TRADER: NATURAL TRAILING STOP (Chandelier Exit) ---
-                    if self.mode == 'swing':
-                        try:
-                            df_daily = self.pipeline.market_fetcher.get_bars(symbol, lookback_days=40, timeframe='1D')
-                            if df_daily is not None and not df_daily.empty and len(df_daily) > 20:
-                                stop_price, atr_value = self._calculate_atr_trailing_stop(
-                                    df_daily, atr_period=14, multiplier=self.config.TRAILING_ATR_MULT
-                                )
-                                if stop_price is not None:
-                                    if current_price < stop_price:
-                                        action = 2 # Force Sell
-                        except Exception: pass
+                    # --- SWING TRADER: TRAILING STOP DISABLED (Agent Brain Only Mode) ---
+                    # Backtest showed 81% win rate with agent-only exits vs 40% with stops
+                    # if self.mode == 'swing':
+                    #     try:
+                    #         df_daily = self.pipeline.market_fetcher.get_bars(symbol, lookback_days=40, timeframe='1D')
+                    #         if df_daily is not None and not df_daily.empty and len(df_daily) > 20:
+                    #             stop_price, atr_value = self._calculate_atr_trailing_stop(
+                    #                 df_daily, atr_period=14, multiplier=self.config.TRAILING_ATR_MULT
+                    #             )
+                    #             if stop_price is not None:
+                    #                 if current_price < stop_price:
+                    #                     action = 2 # Force Sell
+                    #     except Exception: pass
 
                     # --- CRYPTO TRADER: SUPERTREND FILTER ---
                     if self.mode == 'crypto' and self.supertrend:
@@ -771,16 +766,47 @@ class MultiModalTrader:
             # actions: 0=HOLD, 1=BUY, 2=SELL.
             # We separate them.
             
-            buys = [x for x in scored_opportunities if x['action'] == 1 and x['confidence'] > 0.40]
+            # DEBUG: Log action distribution BEFORE filtering
+            action_counts = {0: 0, 1: 0, 2: 0}
+            for x in scored_opportunities:
+                action_counts[x['action']] = action_counts.get(x['action'], 0) + 1
+            print(f"   📊 Raw Actions: HOLD={action_counts[0]}, BUY={action_counts[1]}, SELL={action_counts[2]}")
+            
+            # DEBUG: Show top BUY candidates BEFORE confidence filter (only if any pass threshold)
+            raw_buys = [x for x in scored_opportunities if x['action'] == 1]
+            threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.60)
+            
+            passing_buys = [x for x in raw_buys if x['confidence'] > threshold]
+            if passing_buys:
+                print(f"   🔍 Top BUY candidates passing {threshold} threshold:")
+                for rb in sorted(passing_buys, key=lambda x: x['confidence'], reverse=True)[:5]:
+                    print(f"      {rb['symbol']}: Conf={rb['confidence']:.3f}")
+            elif raw_buys:
+                top_raw = max(raw_buys, key=lambda x: x['confidence'])
+                print(f"   🔍 No buys above {threshold} threshold (best: {top_raw['symbol']} @ {top_raw['confidence']:.3f})")
+            
+            buys = [x for x in scored_opportunities if x['action'] == 1 and x['confidence'] > threshold]
+            
+            # CRITICAL FIX: Filter out symbols we already hold BEFORE sniper mode
+            held_symbols = {p.symbol for p in self.cached_positions}
+            buys_before_filter = len(buys)
+            
+            # Identify which ones are being dropped for logging
+            dropped_symbols = [x['symbol'] for x in buys if x['symbol'] in held_symbols]
+            buys = [x for x in buys if x['symbol'] not in held_symbols]
+            
+            if dropped_symbols:
+                print(f"   🔇 Filtered out {len(dropped_symbols)} BUY signals for already-held positions: {', '.join(dropped_symbols)}")
             # CRITICAL: Only treat as SELL if confidence is HIGH (model is certain about exit)
             # Avoid selling on weak signals which are just neutral HOLDS
-            sells = [x for x in scored_opportunities if x['action'] == 2 and x['confidence'] > 0.40]
+            sell_threshold = getattr(self.config, 'SELL_CONFIDENCE_THRESHOLD', threshold)
+            sells = [x for x in scored_opportunities if x['action'] == 2 and x['confidence'] > sell_threshold]
             
             # Debug: Log filtered SELL count
             sells_raw = [x for x in scored_opportunities if x['action'] == 2]
             if sells_raw and len(sells) < len(sells_raw):
                 filtered_out = len(sells_raw) - len(sells)
-                print(f"   🔇 Filtered out {filtered_out} weak SELL signals (low confidence).")
+                print(f"   🔇 Filtered out {filtered_out} weak SELL signals (below {sell_threshold}).")
             
             # DEBUG: Check confidence distribution
             if scored_opportunities:
@@ -795,6 +821,18 @@ class MultiModalTrader:
             target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
             current_holdings = len([p for p in self.cached_positions if getattr(p, 'asset_class', 'us_equity') == target_asset_class])
             slots_left = max(0, self.config.MAX_POSITIONS - current_holdings)
+            
+            # DEBUG: Position state
+            print(f"   📦 Position State: {current_holdings}/{self.config.MAX_POSITIONS} | Slots Available: {slots_left}")
+            
+            # CRITICAL: Skip ALL buys if buying power is too low (< $50)
+            if self.cached_buying_power < 50:
+                print(f"   ⚠️ Insufficient Buying Power (${self.cached_buying_power:.2f}). Skipping ALL BUY signals.")
+                buys = []
+            elif buys:
+                print(f"   📈 BUY signals after confidence filter: {len(buys)}")
+            else:
+                print(f"   ⚠️ NO BUY signals passed confidence filter (need >{threshold:.2f})")
 
             # Filter buys list to match available slots (Sniper Mode)
             if buys and slots_left < len(buys):
@@ -820,10 +858,13 @@ class MultiModalTrader:
                      print(f"📉 Executing SELL for {item['symbol']} (Conf: {item['confidence']:.2f})")
                      self.execute_trade(item['symbol'], 2, item['price'], confidence=item['confidence'])
                 
-            # Execute BUYs (Top N)
+            # Execute BUYs (Top N) - STOP if we run out of buying power
             for item in buys:
                 print(f"📈 Executing BUY for {item['symbol']} (Conf: {item['confidence']:.2f})")
-                self.execute_trade(item['symbol'], 1, item['price'], confidence=item['confidence'])
+                result = self.execute_trade(item['symbol'], 1, item['price'], confidence=item['confidence'])
+                if result == 'NO_BP':
+                    print("   🛑 Stopping all BUY attempts - insufficient buying power.")
+                    break
 
             # Sleep
             sleep_time = 30 if self.mode == 'day' else 60

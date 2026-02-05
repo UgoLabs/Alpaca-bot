@@ -64,30 +64,6 @@ def calculate_stoch(high, low, close, window=14, smooth_window=3):
     d = k.rolling(window=smooth_window).mean()
     return k, d
 
-def add_technical_indicators(df):
-    """
-    Adds comprehensive technical indicators to the DataFrame.
-    Expects columns: 'Open', 'High', 'Low', 'Close', 'Volume'
-    """
-    df = df.copy()
-    
-    # Handle MultiIndex and basic cleanup
-    if isinstance(df.columns, pd.MultiIndex):
-        try: df.columns = df.columns.get_level_values(0)
-        except: pass
-    df = df.loc[:, ~df.columns.duplicated()]
-    
-    # Ensure numeric and fill NaNs robustly
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    if 'Close' in df.columns: df['Close'] = df['Close'].ffill().bfill()
-    if 'High' in df.columns: df['High'] = df['High'].fillna(df['Close'])
-    if 'Low' in df.columns: df['Low'] = df['Low'].fillna(df['Close'])
-    if 'Open' in df.columns: df['Open'] = df['Open'].fillna(df['Close'])
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
-
 def calculate_atr(high, low, close, window=14):
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
@@ -162,7 +138,7 @@ def add_technical_indicators(df):
     df['williams_r'] = (-100 * (highest_high - close) / (highest_high - lowest_low).replace(0, 1)).fillna(-50)
     
     # ROC
-    df['roc'] = close.pct_change(periods=10).fillna(0) * 100
+    df['roc'] = close.pct_change(periods=10, fill_method=None).fillna(0) * 100
 
     # 3. VOLATILITY
     bb_mid, bb_high, bb_low = calculate_bollinger_bands(close)
@@ -201,16 +177,16 @@ def add_technical_indicators(df):
     df['price_vs_sma50'] = (close - df['sma_50']) / df['sma_50'].replace(0, 1)
     df['price_vs_sma200'] = (close - df['sma_200']) / df['sma_200'].replace(0, 1)
     
-    df['sma20_slope'] = df['sma_20'].pct_change(periods=5).fillna(0)
-    df['sma50_slope'] = df['sma_50'].pct_change(periods=10).fillna(0)
+    df['sma20_slope'] = df['sma_20'].pct_change(periods=5, fill_method=None).fillna(0)
+    df['sma50_slope'] = df['sma_50'].pct_change(periods=10, fill_method=None).fillna(0)
     
     df['sma_cross'] = np.where(df['sma_50'] > df['sma_200'], 1, -1)
     df['volatility_regime'] = df['atr'] / close.replace(0, 1)
     
-    df['momentum_5d'] = close.pct_change(periods=5).fillna(0)
-    df['momentum_10d'] = close.pct_change(periods=10).fillna(0)
-    df['momentum_20d'] = close.pct_change(periods=20).fillna(0)
-    df['return_volatility'] = close.pct_change().rolling(window=20).std().fillna(0)
+    df['momentum_5d'] = close.pct_change(periods=5, fill_method=None).fillna(0)
+    df['momentum_10d'] = close.pct_change(periods=10, fill_method=None).fillna(0)
+    df['momentum_20d'] = close.pct_change(periods=20, fill_method=None).fillna(0)
+    df['return_volatility'] = close.pct_change(fill_method=None).rolling(window=20).std().fillna(0)
 
     # 6. MARKET REGIME DETECTION (Enhanced for Bull/Bear)
     # Basic Regime: +1 = Bull, -1 = Bear, 0 = Neutral
@@ -228,13 +204,13 @@ def add_technical_indicators(df):
     df['bear_flag'] = np.where(df['drawdown_pct'] < -0.10, 1, 0)
     
     # Volatility regime: high vol = uncertainty (often bear)
-    vol_20 = close.pct_change().rolling(window=20).std().fillna(0)
-    vol_60 = close.pct_change().rolling(window=60).std().fillna(0)
+    vol_20 = close.pct_change(fill_method=None).rolling(window=20).std().fillna(0)
+    vol_60 = close.pct_change(fill_method=None).rolling(window=60).std().fillna(0)
     df['vol_expansion'] = np.where(vol_20 > vol_60 * 1.5, 1, 0)  # Vol spike
     
     # Momentum regime: negative momentum = bear
-    mom_20 = close.pct_change(periods=20).fillna(0)
-    mom_60 = close.pct_change(periods=60).fillna(0)
+    mom_20 = close.pct_change(periods=20, fill_method=None).fillna(0)
+    mom_60 = close.pct_change(periods=60, fill_method=None).fillna(0)
     df['momentum_regime'] = np.where(
         (mom_20 > 0) & (mom_60 > 0), 1,  # Bull momentum
         np.where((mom_20 < 0) & (mom_60 < 0), -1, 0)  # Bear momentum

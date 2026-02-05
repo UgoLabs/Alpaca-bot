@@ -7,6 +7,7 @@ Usage:
     python manage.py status   # Check what's running & view latest logs
     python manage.py train    # Start GPU Training (Hidden Mode)
     python manage.py stop     # Stop Training
+    python manage.py run [mode] # Start Trading Bot (swing, day, crypto)
     python manage.py clean    # Clean logs and pycache
 """
 import os
@@ -21,6 +22,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(ROOT_DIR, 'logs')
 VENV_PYTHON = os.path.join(ROOT_DIR, '.venv', 'Scripts', 'python.exe')
 TRAIN_SCRIPT = os.path.join(ROOT_DIR, 'scripts', 'train_multimodal.py')
+BOT_SCRIPT = os.path.join(ROOT_DIR, 'src', 'bots', 'multimodal_trader.py')
 TRAIN_PID_FILE = os.path.join(LOG_DIR, 'training.pid')
 
 # Ensure log dir exists
@@ -393,6 +395,25 @@ def clean_workspace():
     print("✅ Cleanup complete.")
 
 
+def run_bot(mode):
+    """Launch the trading bot in the specified mode."""
+    valid_modes = ['swing', 'day', 'crypto']
+    if mode not in valid_modes:
+        print(f"❌ Invalid mode: {mode}")
+        print(f"   Available modes: {', '.join(valid_modes)}")
+        return
+
+    print(f"🚀 Launching {mode.upper()} Trader...")
+    print(f"   Script: {BOT_SCRIPT}")
+    print("-" * 50)
+    
+    # Use subprocess.call to let it take over the terminal input/output
+    try:
+        subprocess.call([VENV_PYTHON, BOT_SCRIPT, "--mode", mode])
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -400,6 +421,12 @@ def main():
 
     action = sys.argv[1].lower()
     
+    # Support direct flag starting with -- (e.g. python manage.py --mode swing)
+    if action.startswith("--"):
+        # Just pass everything to the bot script if it looks like bot args
+        # But this is messy. Let's stick to verbs.
+        pass
+
     if action == 'status':
         show_status()
     elif action == 'train':
@@ -409,9 +436,26 @@ def main():
         stop_local()
     elif action == 'clean':
         clean_workspace()
+    elif action == 'run':
+        if len(sys.argv) < 3:
+            # check if --mode was passed? No, simplify: python manage.py run swing
+            print("❌ Missing mode. Usage: python manage.py run <swing|day|crypto>")
+            return
+        mode_arg = sys.argv[2]
+        run_bot(mode_arg)
+    # Allow shortcuts: python manage.py swing
+    elif action in ['swing', 'day', 'crypto']:
+        run_bot(action)
+    elif action == '--mode':
+         # Handle the user's specific attempt: python manage.py --mode swing
+         if len(sys.argv) < 3:
+             print("❌ Missing mode argument.")
+             return
+         run_bot(sys.argv[2])
     else:
         print(f"❌ Unknown command: {action}")
         print(__doc__)
+
 
 
 if __name__ == "__main__":

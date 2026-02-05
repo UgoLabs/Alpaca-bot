@@ -79,6 +79,9 @@ class VectorizedTradingEnv:
         self.profit_take_atr_mult = float(getattr(TrainingConfig, 'PROFIT_TAKE_ATR_MULT', 4.0))
         # Track highest price since entry (for trailing stop)
         self.high_since_entry = torch.zeros(self.num_envs, device=device)
+        # New for Gen11: Track Peak Equity for Drawdown Penalty
+        self.peak_equity = torch.full((self.num_envs,), self.initial_balance, device=device)
+
         # Simple ATR approximation: rolling volatility (we'll compute per-step)
         self.atr_window = int(getattr(TrainingConfig, 'ATR_WINDOW', 14))
         
@@ -107,6 +110,8 @@ class VectorizedTradingEnv:
         self.prev_equity.fill_(self.initial_balance)
         self.steps_in_position.zero_()
         self.high_since_entry.zero_()
+        # New for Gen11
+        self.peak_equity.fill_(self.initial_balance)
         
         return self._get_observation()
         
@@ -235,40 +240,45 @@ class VectorizedTradingEnv:
         safe_equity_t = torch.clamp(equity_t, min=1e-6)
         reward_lr = torch.log(torch.clamp(equity_tp1 / safe_equity_t, min=1e-6))
         
-        # ===== REWARD SCALING: Scale up tiny log-returns for better Q-value spread =====
-        # Log-returns are typically -0.001 to +0.001. Scale to -0.1 to +0.1 range.
-        rewards = reward_lr * self.reward_scale
+        # ===== GEN 2 (SHARPE): BALANCED RISK-RETURN REWARD =====
+        # Problem: Gen 1 learned to never trade (safest strategy)
+        # Solution: Add inaction penalty + entry bonus to force engagement
         
-        # ===== REGIME-AWARE REWARD SHAPING =====
-        # Detect bear market: price < SMA(lookback) for this step
-        # Give BONUS rewards for correct bear market behavior:
-        # - HOLD/SELL when flat in downtrend = good (avoided loss)
-        # - SELL when in position during downtrend = good (cut losses)
-        # - BUY in downtrend that works = extra bonus (caught the reversal)
-        lookback_step = torch.clamp(self.current_step - self.trend_lookback, min=0)
-        lookback_prices = self.prices[self._row_indices, lookback_step]
-        in_downtrend = current_prices < lookback_prices * 0.95  # Price 5%+ below lookback = bear
+        # 1. Base Reward: Scaled log return
+        r_t = reward_lr * self.reward_scale  # reward_scale = 100, so +1% = +1.0 reward
+        rewards = r_t
         
-        if in_downtrend.any():
-            # Correct behavior in downtrend gets multiplied reward
-            # SELL in downtrend while in position = smart exit
-            smart_exit = sell_mask & in_downtrend & (sell_pnl_pct < 0)  # Cut losses
-            if smart_exit.any():
-                # Reduce the loss penalty - cutting losses early is GOOD
-                rewards[smart_exit] *= 0.5  # Halve the negative reward for smart exits
-            
-            # HOLD when flat in downtrend = correctly avoided buying the dip too early
-            smart_hold = (effective_actions == 0) & (~self.in_position) & in_downtrend
-            if smart_hold.any():
-                rewards[smart_hold] += 0.01 * self.reward_scale  # Small bonus for patience
+        # 2. INACTION PENALTY: Punish holding cash too long
+        # This forces the agent to find opportunities rather than sit idle
+        cash_idle = ~self.in_position
+        if cash_idle.any():
+            # Small penalty for each step holding only cash
+            rewards[cash_idle] -= 0.001 * self.reward_scale  # -0.1 per step if idle
         
-        # ===== EXIT REWARD SHAPING: Bonus for profitable exits =====
-        profitable_exits = sell_mask & (sell_pnl_pct > 0)
-        if profitable_exits.any():
-            profit_bonus = torch.clamp(sell_pnl_pct[profitable_exits], max=0.10) * self.exit_profit_bonus * 10 * self.reward_scale
-            rewards[profitable_exits] += profit_bonus
+        # 3. ENTRY BONUS: Reward taking positions (overcomes transaction cost fear)
+        if buy_mask.any():
+            rewards[buy_mask] += 0.005 * self.reward_scale  # +0.5 bonus for entering
         
-        # ===== HOLDING LOSS PENALTY: Penalize holding losing positions =====
+        # 4. PROFITABLE EXIT BONUS: Strongly reward locking in gains
+        profitable_exit = sell_mask & (sell_pnl_pct > 0.005)  # >0.5% profit
+        if profitable_exit.any():
+            # Scale bonus by profit size (1% = +1.0, 5% = +5.0 before reward_scale)
+            profit_bonus = sell_pnl_pct[profitable_exit] * self.reward_scale  # 1% profit = +1.0
+            rewards[profitable_exit] += profit_bonus
+        
+        # 5. CUT LOSS BONUS: Reward exiting small losses (prevents holding disasters)
+        cut_loss = sell_mask & (sell_pnl_pct < 0) & (sell_pnl_pct > -0.03)
+        if cut_loss.any():
+            rewards[cut_loss] += 0.003 * self.reward_scale  # +0.3 for smart exits
+        
+        # 6. HOLDING WINNER BONUS: Reward staying in profitable trades
+        if self.in_position.any():
+            unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
+            winning_hold = self.in_position & (unrealized_pnl_pct > 0.01)
+            if winning_hold.any():
+                rewards[winning_hold] += 0.002 * self.reward_scale  # +0.2 per step in winner
+
+        # ===== HOLDING LOSS PENALTY (Standard) =====
         if self.in_position.any():
             unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
             losing_positions = self.in_position & (unrealized_pnl_pct < -self.loss_threshold_pct)
@@ -305,6 +315,7 @@ class VectorizedTradingEnv:
             self.in_position[dones] = False
             self.steps_in_position[dones] = 0
             self.high_since_entry[dones] = 0.0  # Reset trailing stop tracker
+            self.peak_equity[dones] = self.initial_balance # Reset Peak Equity
             # We don't reset total_reward here to track episode, but for RL training loop we just need 'done' flag
             
         next_obs = self._get_observation()

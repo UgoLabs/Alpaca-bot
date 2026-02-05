@@ -79,6 +79,9 @@ class VectorizedTradingEnv:
         self.profit_take_atr_mult = float(getattr(TrainingConfig, 'PROFIT_TAKE_ATR_MULT', 4.0))
         # Track highest price since entry (for trailing stop)
         self.high_since_entry = torch.zeros(self.num_envs, device=device)
+        # New for Gen11: Track Peak Equity for Drawdown Penalty
+        self.peak_equity = torch.full((self.num_envs,), self.initial_balance, device=device)
+
         # Simple ATR approximation: rolling volatility (we'll compute per-step)
         self.atr_window = int(getattr(TrainingConfig, 'ATR_WINDOW', 14))
         
@@ -107,6 +110,8 @@ class VectorizedTradingEnv:
         self.prev_equity.fill_(self.initial_balance)
         self.steps_in_position.zero_()
         self.high_since_entry.zero_()
+        # New for Gen11
+        self.peak_equity.fill_(self.initial_balance)
         
         return self._get_observation()
         
@@ -235,9 +240,33 @@ class VectorizedTradingEnv:
         safe_equity_t = torch.clamp(equity_t, min=1e-6)
         reward_lr = torch.log(torch.clamp(equity_tp1 / safe_equity_t, min=1e-6))
         
+        # ===== GEN11: DRAWDOWN PENALTY =====
+        # Update Peak Equity
+        self.peak_equity = torch.maximum(self.peak_equity, equity_tp1)
+        
+        # Calculate Drawdown %
+        current_drawdown = (self.peak_equity - equity_tp1) / self.peak_equity
+        
+        # Quadratic Penalty: Penalize deep drawdowns heavily
+        # If DD is 10%, penalty is 0.1^2 * 10 = 0.1 (Huge!)
+        # With multiplier 4.0: 0.1^2 * 4.0 = 0.04
+        dd_penalty = (current_drawdown ** 2) * 4.0
+        
         # ===== REWARD SCALING: Scale up tiny log-returns for better Q-value spread =====
         # Log-returns are typically -0.001 to +0.001. Scale to -0.1 to +0.1 range.
         rewards = reward_lr * self.reward_scale
+        
+        # Apply Drawdown Penalty
+        rewards -= dd_penalty * self.reward_scale
+        
+        # ===== GEN11 UPDATE: Reward holding winners (Fix Overtrading) =====
+        if self.in_position.any():
+             unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
+             # Bonus for holding a position that is > 0.5% profitable
+             # This encourages longer duration trades vs scalping
+             winning_positions = self.in_position & (unrealized_pnl_pct > 0.005) 
+             if winning_positions.any():
+                 rewards[winning_positions] += 0.001 * self.reward_scale
         
         # ===== REGIME-AWARE REWARD SHAPING =====
         # Detect bear market: price < SMA(lookback) for this step
@@ -305,6 +334,7 @@ class VectorizedTradingEnv:
             self.in_position[dones] = False
             self.steps_in_position[dones] = 0
             self.high_since_entry[dones] = 0.0  # Reset trailing stop tracker
+            self.peak_equity[dones] = self.initial_balance # Reset Peak Equity
             # We don't reset total_reward here to track episode, but for RL training loop we just need 'done' flag
             
         next_obs = self._get_observation()

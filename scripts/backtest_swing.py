@@ -155,13 +155,13 @@ def download_test_data(
     return test_symbols
 
 def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_mult: float = 3.0, test_start_date: str = None, test_end_date: str = None):
-    print(f"📥 Loading Swing Data from {data_dir}...")
+    print(f"Loading Swing Data from {data_dir}...")
     pattern = os.path.join(data_dir, "*_1D.csv")
     files = glob.glob(pattern)
     
     if not files:
-        print(f"❌ No data found in {data_dir}!")
-        return None, None, None
+        print(f"No data found in {data_dir}!")
+        return None, None, None, None, None
         
     data_list = []
     price_list = []
@@ -212,7 +212,8 @@ def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_
             df = add_technical_indicators(df)
             df = df.replace([np.inf, -np.inf], np.nan).dropna()
             
-            if len(df) < 200: 
+            if len(df) < 10: 
+                # print(f"Skipping {ticker} (len={len(df)})")
                 continue
                 
             processed_dfs.append((df, ticker))
@@ -223,30 +224,48 @@ def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_
             continue
             
     if not processed_dfs:
-        return None, None, None
+        print("load_swing_data: No processed_dfs found! Returning 5 Nones.")
+        return None, None, None, None, None
         
-    print(f"📏 Max Sequence Length: {max_seq_len}")
+    print(f"Max Sequence Length: {max_seq_len}")
+    
+    # Second pass: Process and collect
+    final_data_list = []
     
     for df, ticker in processed_dfs:
         raw_close = df['Close'].values
         raw_stop = _compute_chandelier_stop(df, atr_period=atr_period, atr_mult=atr_mult)
-        raw_atr = _compute_atr(df, atr_period=atr_period)
+        
+        # Simple ATR calc inline to avoid messing with imports again
+        tr1 = df['High'] - df['Low']
+        tr2 = (df['High'] - df['Close'].shift(1)).abs()
+        tr3 = (df['Low'] - df['Close'].shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        raw_atr = tr.rolling(window=14).mean().fillna(0).values
         
         feature_cols = [
-            'Open', 'High', 'Low', 'Close', 'Volume',
-            'rsi', 'macd', 'macd_signal', 'adx', 'sma_20', 'ema_12'
+            'sma_10', 'sma_20', 'sma_50', 'sma_200', 
+            'atr', 'bb_width', 'bb_upper', 'bb_lower', 
+            'ema_12', 'ema_26', 
+            'macd', 'macd_signal', 'macd_diff', 
+            'adx', 'rsi', 'stoch_k', 'stoch_d', 
+            'williams_r', 'roc', 'bb_pband', 
+            'volume_sma', 'volume_ratio', 'obv', 'mfi', 'price_vs_sma20'
         ]
         
         valid_cols = [c for c in feature_cols if c in df.columns]
-        if len(valid_cols) < 5:
+        if len(valid_cols) < 25:
             continue
             
-        features = df[valid_cols].values
+        features = df[feature_cols].values
         
-        mean = np.mean(features, axis=0)
-        std = np.std(features, axis=0) + 1e-8
+        mean = np.mean(features, axis=0, keepdims=True)
+        std = np.std(features, axis=0, keepdims=True) + 1e-8
         norm_features = (features - mean) / std
+        norm_features = np.clip(norm_features, -10, 10)
+        norm_features = np.nan_to_num(norm_features, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Pad directly here
         curr_len = len(norm_features)
         if curr_len < max_seq_len:
             pad_len = max_seq_len - curr_len
@@ -254,12 +273,15 @@ def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_
             raw_close = np.pad(raw_close, (pad_len, 0), mode='edge')
             raw_stop = np.pad(raw_stop, (pad_len, 0), mode='edge')
             raw_atr = np.pad(raw_atr, (pad_len, 0), mode='edge')
-        
+            
         data_list.append(norm_features)
         price_list.append(raw_close)
         stop_list.append(raw_stop)
         atr_list.append(raw_atr)
         tickers.append(ticker)
+
+    if not data_list:
+        return None, None, None, None, None
             
     data_tensor = torch.FloatTensor(np.array(data_list))
     price_tensor = torch.FloatTensor(np.array(price_list))
@@ -285,11 +307,11 @@ def run_backtest(
     visualize: bool = False,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🚀 Starting Swing Bot Backtest on {device}...")
+    print(f"Starting Swing Bot Backtest on {device}...")
     
     data_dir = "data/historical_swing"
     if test_generalization:
-        print("🧪 MODE: Generalization Test (Unseen Symbols)")
+        print("MODE: Generalization Test (Unseen Symbols)")
         data_dir = "data/test_swing"
         download_test_data(data_dir, test_count=test_count, period=period, interval="1d", seed=seed)
     
@@ -304,18 +326,18 @@ def run_backtest(
     if data is None:
         return
     
-    print(f"📊 Data Shape: {data.shape}")
-    print(f"📈 Tickers: {len(tickers)}")
+    print(f"Data Shape: {data.shape}")
+    print(f"Tickers: {len(tickers)}")
 
     if test_start_date:
-        print(f"📅 Test Start Date: {test_start_date}")
+        print(f"Test Start Date: {test_start_date}")
 
     if use_trailing_stop:
-        print(f"🛑 Exits: Chandelier/ATR Trailing Stop enabled (ATR={atr_period}, Mult={atr_mult})")
+        print(f"Exits: Chandelier/ATR Trailing Stop enabled (ATR={atr_period}, Mult={atr_mult})")
     if use_profit_take:
-        print(f"🎯 Exits: ATR Profit-Take enabled (Profit ATR Mult={profit_atr_mult})")
+        print(f"Exits: ATR Profit-Take enabled (Profit ATR Mult={profit_atr_mult})")
     if position_pct != 1.0:
-        print(f"💵 Position Sizing: position_pct={position_pct}")
+        print(f"Position Sizing: position_pct={position_pct}")
     
     # 2. Initialize Environment
     env = VectorizedTradingEnv(data, prices, device=device, position_pct=position_pct)
@@ -334,16 +356,16 @@ def run_backtest(
     )
     
     # 4. Load Model
-    print(f"🔄 Loading Model from {model_path}...")
+    print(f"Loading Model from {model_path}...")
     try:
         agent.load(model_path)
-        print("✅ Model loaded successfully")
+        print("Model loaded successfully")
     except Exception as e:
-        print(f"❌ Could not load model: {e}")
+        print(f"Could not load model: {e}")
         return
 
     # 5. Run Backtest
-    print("▶️ Running Backtest...")
+    print("Running Backtest...")
     
     # Set to evaluation mode (no epsilon exploration)
     for sub_agent in agent.agents:
@@ -351,6 +373,9 @@ def run_backtest(
         sub_agent.policy_net.eval()
         
     state = env.reset()
+    # Force deterministic start for backtest
+    env.current_step.fill_(env.window_size) 
+    state = env._get_observation()
     
     # Dummy Text Data
     seq_len = 64
@@ -365,6 +390,7 @@ def run_backtest(
     
     # Track actions
     action_counts = {0: 0, 1: 0, 2: 0} # Hold, Buy, Sell
+    all_realized_pnls = []
     
     # Visualization Setup
     viz_indices = []
@@ -374,7 +400,7 @@ def run_backtest(
         import random
         num_viz = min(3, env.num_envs)
         viz_indices = random.sample(range(env.num_envs), num_viz)
-        print(f"🎨 Visualization enabled for indices: {viz_indices} ({[tickers[i] for i in viz_indices]})")
+        print(f"Visualization enabled for indices: {viz_indices} ({[tickers[i] for i in viz_indices]})")
         
         for idx in viz_indices:
             viz_data[idx] = {
@@ -426,6 +452,13 @@ def run_backtest(
 
         next_state, rewards, dones, infos = env.step(actions)
 
+        # Track PnL
+        if 'realized_pnl' in infos:
+            mask = infos.get('sell_mask')
+            if mask is not None and mask.any():
+                 pnl_values = infos['realized_pnl'][mask].cpu().numpy()
+                 all_realized_pnls.extend(pnl_values)
+
         total_reward += float(rewards.sum().item())
         
         unique, counts = np.unique(actions.cpu().numpy(), return_counts=True)
@@ -434,8 +467,35 @@ def run_backtest(
             
         state = next_state
         
-    print("\n📊 Backtest Results Summary:")
+    print("\nBacktest Results Summary:")
     print("-" * 30)
+    
+    # Analyze PnL
+    n_trades = 0
+    n_wins = 0
+    if all_realized_pnls:
+        pnls = np.array(all_realized_pnls)
+        wins = pnls[pnls > 0]
+        losses = pnls[pnls <= 0]
+        
+        n_trades = len(pnls)
+        n_wins = len(wins)
+        n_losses = len(losses)
+        win_rate = (n_wins / n_trades * 100) if n_trades > 0 else 0.0
+        
+        avg_win = wins.mean() * 100 if n_wins > 0 else 0.0
+        avg_loss = losses.mean() * 100 if n_losses > 0 else 0.0
+        
+        print(f"Trade Analysis (PnL):")
+        print(f"  Total Trades: {n_trades}")
+        print(f"  Win Rate:     {win_rate:.1f}%")
+        print(f"  Avg Win:      {avg_win:.2f}%")
+        print(f"  Avg Loss:     {avg_loss:.2f}%")
+        if avg_loss != 0:
+            print(f"  Risk/Reward:  {abs(avg_win/avg_loss):.2f}")
+    else:
+        print("Trade Analysis (PnL): No completed trades.")
+
     print(f"Action Distribution:")
     total_actions = sum(action_counts.values())
     if total_actions > 0:
@@ -453,7 +513,7 @@ def run_backtest(
     print(f"Average Reward per Symbol: {avg_reward:.6f}")
     
     if visualize:
-        print("\n🎨 Generating Plots...")
+        print("\nGenerating Plots...")
         os.makedirs("plots", exist_ok=True)
         for idx, data in viz_data.items():
             ticker = data['ticker']
@@ -509,7 +569,17 @@ def run_backtest(
             plt.close()
             print(f"   Saved plot to {plot_path}")
 
-    print("\n✅ Backtest Complete.")
+    print("\nBacktest Complete.")
+    
+    return {
+        'total_reward': total_reward,
+        'avg_reward_per_symbol': avg_reward,
+        'win_rate': (n_wins / n_trades) if n_trades > 0 else 0.0,
+        'trades': n_trades,
+        'forced_buys': 0,
+        'forced_loss_sells': forced_sells,
+        'forced_profit_sells': forced_profit_sells
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Swing backtest + generalization check")

@@ -1,0 +1,9 @@
+.venv/
+models/
+data/
+logs/
+*.pth
+*.dll
+*.lib
+*.exe
+__pycache__/

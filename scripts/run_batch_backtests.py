@@ -26,15 +26,18 @@ def main():
             prefix = match.group(1)
             ep_num = int(match.group(2))
             
-            if ep_num > 330:
+            # Backtest specific episodes:
+            # User request: 380, 895, 900, 905
+            if ep_num in [380, 895, 900, 905]:
                 full_prefix_path = os.path.join(models_dir, prefix).replace("\\", "/")
+                # Ensure we don't accidentally add duplicates if logic changes
                 unique_prefixes.add((ep_num, full_prefix_path))
 
     # Sort by episode number
     sorted_prefixes = sorted(list(unique_prefixes), key=lambda x: x[0])
     
     if not sorted_prefixes:
-        print("No models found with episode > 330.")
+        print("No models found with episode >= 380.")
         return
 
     print(f"Found {len(sorted_prefixes)} models to backtest.")
@@ -46,11 +49,17 @@ def main():
         print(f"Testing Episode {ep}: {prefix_path}")
         print(f"{'='*50}")
         
+        # Updated to "Gen 7 Refined" parameters + Hold-Out Period
         cmd = [
             sys.executable, "scripts/backtest_swing.py",
             prefix_path,
             "--use-trailing-stop",
-            "--atr-mult", "6.0"
+            "--atr-mult", "3.0",
+            "--use-profit-take",
+            "--profit-atr-mult", "5.0",
+            "--position-pct", "0.1",
+            "--test-start-date", "2025-08-01",
+            "--test-end-date", "2026-01-23"
         ]
         
         # Run command and capture output

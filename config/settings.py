@@ -65,18 +65,19 @@ class MoneyScraperConfig:
 
 
 class SwingTraderConfig:
-    """Multi-day swing trader settings"""
-    MAX_POSITIONS = 10
-    SCAN_INTERVAL_MINUTES = int(os.getenv("SWING_SCAN_INTERVAL_MINUTES", "5"))
-    USE_WEBSOCKET = False
-    WATCHLIST = "my_portfolio.txt"
-    # Tuned exits (Phase 2): mandatory ATR trailing stop + ATR profit-take
-    # User Preference: Reverted to 6.0 based on Backtest (Allows for volatility)
-    # Note: With $5k acct, this allows deeper drawdowns but stays true to the model.
-    STOP_ATR_MULT = 6.0
-    TRAILING_ATR_MULT = 6.0
-    # kept Profit at 4.0 to encourage holding winners, but we can revert to 3.0 if strictly following backtest
-    PROFIT_ATR_MULT = 3.0 
+    MAX_POSITIONS = 20           # 20 Slots (Verified Best Config)
+    PROFIT_TARGET_PCT = 0.20    # Only used if no Stop ATR
+    STOP_LOSS_PCT = 0.10        # Only used if no Stop ATR
+    SCAN_INTERVAL_MINUTES = 60
+    CONFIDENCE_THRESHOLD = 0.70 # Picky Entry (Top Tier Only)
+    SELL_CONFIDENCE_THRESHOLD = 0.20 # Agile Exit (Sell fast on weak signals)
+    
+    # Enable Trailing Stops (Defaults)
+    USE_TRAILING_STOP = True
+    STOP_ATR_MULT = 2.0 # Margin Safe (Tight Stops)
+    PROFIT_ATR_MULT = 5.0
+    TRAILING_ATR_MULT = 100.0 # Disable strict trailing stop (still rely on Agent + Hard Stop)
+    PROFIT_ATR_MULT = 5.0     # Profit Target (5x ATR)
     LIQUIDATE_EOD = False
     ONLINE_LEARNING = True
     EXPLORATION_EPSILON = 0.03  # 3% exploration for swing trades
@@ -86,6 +87,7 @@ class SwingTraderConfig:
 class DayTraderConfig:
     """Intraday trend trader (The 'Slice')"""
     MAX_POSITIONS = 10
+    CONFIDENCE_THRESHOLD = 0.60
     PROFIT_TARGET_PCT = 0.015   # +1.5% (Day Trend)
     STOP_LOSS_PCT = 0.005       # -0.5% (Room to breathe)
     SCAN_INTERVAL_SECONDS = 900 # 15 minutes
@@ -100,6 +102,7 @@ class DayTraderConfig:
 class CryptoTraderConfig:
     """24/7 crypto trader settings."""
     MAX_POSITIONS = int(os.getenv("CRYPTO_MAX_POSITIONS", "5"))
+    CONFIDENCE_THRESHOLD = 0.60
     SCAN_INTERVAL_SECONDS = int(os.getenv("CRYPTO_SCAN_INTERVAL_SECONDS", "30"))
     WATCHLIST = os.getenv("CRYPTO_WATCHLIST", "crypto_watchlist.txt")
     DATA_FEED = 'sip'  # Default, though crypto uses get_crypto_bars
@@ -116,7 +119,7 @@ class CryptoTraderConfig:
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
 # Specialized Model Paths (Option A Architecture)
-SWING_MODEL_PATH = MODEL_DIR / "ensemble_ep200"  # EP200 Ensemble - 83% backtest return
+SWING_MODEL_PATH = MODEL_DIR / "swing_gen7_refined_ep380_balanced.pth"  # Gen 7 EP380 (Stop 3.0/Profit 5.0 Winner)
 SCALPER_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Day
 SHARED_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Crypto
 REPLAY_BUFFER_PATH = MODEL_DIR / "replay_buffer.pkl"
@@ -138,7 +141,7 @@ class TrainingConfig:
     MAX_POSITIONS = 10
     STOP_ATR_MULT = 6.0       # Stop loss at 6x ATR
     PROFIT_ATR_MULT = 3.0     # Take profit at 3x ATR 
-    CONFIDENCE_THRESHOLD = 0.40  # Only take trades with >40% softmax confidence
+    CONFIDENCE_THRESHOLD = 0.60  # Only take trades with >60% softmax confidence (100% backtest win rate)
     
     # Enable ATR-based stops during training (matches live trading)
     USE_TRAILING_STOP = True

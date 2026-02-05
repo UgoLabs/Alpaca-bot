@@ -227,41 +227,67 @@ def train():
     # Check for existing checkpoints (skip if --fresh flag is passed)
     start_episode = 0
     fresh_start = "--fresh" in sys.argv
+    # The previous run saved as 'ensemble', so we resume from that.
+    model_prefix = "ensemble" 
     
     if fresh_start:
         print("🆕 Fresh start requested. Ignoring existing checkpoints.")
     else:
-        checkpoints = glob.glob("models/ensemble_ep*_balanced.pth")
+        # Search for pattern: models/ensemble_ep*_balanced.pth
+        checkpoints = glob.glob(f"models/{model_prefix}_ep*_balanced.pth")
+        
+        # Fallback: check for gen7 if ensemble not found (just in case)
+        if not checkpoints:
+             checkpoints = glob.glob("models/swing_gen7_refined_ep*_balanced.pth")
+             if checkpoints:
+                 model_prefix = "swing_gen7_refined"
+        
         if checkpoints:
             # Extract episode numbers
             ep_nums = []
             for cp in checkpoints:
                 try:
-                    # Format: models/ensemble_ep5_balanced.pth
-                    num = int(cp.split("ensemble_ep")[1].split("_")[0])
-                    ep_nums.append(num)
-                except:
-                    pass
+                    # Robust parsing for any prefix ending in _ep<NUM>_balanced.pth
+                    # Split by "_ep"
+                    parts = cp.split("_ep")
+                    if len(parts) > 1:
+                        num_part = parts[-1] # "400_balanced.pth"
+                        num = int(num_part.split("_")[0]) # "400"
+                        ep_nums.append(num)
+                except Exception as e:
+                    print(f"⚠️ Error parsing checkpoint {cp}: {e}")
             
             if ep_nums:
                 latest_ep = max(ep_nums)
-                print(f"🔄 Found checkpoint for Episode {latest_ep}. Resuming...")
-                agent.load(f"models/ensemble_ep{latest_ep}")
-                start_episode = latest_ep
+                print(f"🔄 Found checkpoint for Episode {latest_ep} (Prefix: {model_prefix}). Resuming...")
                 
-                # Recalculate Epsilon for the new schedule
-                # User requested fixed exploration of 0.4
-                new_epsilon = 0.4
-                # Adjust decay to reach 0.05 by Episode 100 (approx 250k steps)
-                new_decay = 0.99999 
-                print(f"🔄 Adjusting Epsilon to {new_epsilon:.4f} and Decay to {new_decay} for Episode {start_episode+1}")
-                
-                for sub_agent in agent.agents:
-                    sub_agent.epsilon = new_epsilon
-                    sub_agent.epsilon_decay = new_decay
+                # Load path construction
+                load_path = f"models/{model_prefix}_ep{latest_ep}"
+                try:
+                    agent.load(load_path)
+                    start_episode = latest_ep
+                    print(f"✅ Successfully resumed from Episode {start_episode}")
+                    
+                    # Recalculate Epsilon for the new schedule
+                    # We are continuing training, so we probably want to keep epsilon somewhat low 
+                    # OR if we want to explore more, reset it.
+                    # Given the "frozen" to "active" swing, let's keep it moderate.
+                    # Was 0.4 -> 0.05. If we extend 1000 eps, we should stretch decay.
+                    new_epsilon = 0.3 # Slightly lower start than 0.4
+                    new_decay = 0.99995 # Slower decay for 1000 eps
+                    print(f"🔄 Adjusting Epsilon to {new_epsilon:.4f} and Decay to {new_decay}")
+                    
+                    for sub_agent in agent.agents:
+                        # Only reset if we are actually resuming
+                        sub_agent.epsilon = new_epsilon
+                        sub_agent.epsilon_decay = new_decay
+                        
+                except Exception as e:
+                    print(f"❌ Failed to load checkpoint: {e}")
+                    start_episode = 0
 
     # 4. Training Loop
-    EPISODES = 200 
+    EPISODES = 1400 
     # writer = SummaryWriter(log_dir="logs/runs/ensemble_experiment_1") # Moved to top
     
     # Dummy Text Data (since we don't have historical news)

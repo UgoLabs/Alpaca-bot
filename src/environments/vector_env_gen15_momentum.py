@@ -79,6 +79,9 @@ class VectorizedTradingEnv:
         self.profit_take_atr_mult = float(getattr(TrainingConfig, 'PROFIT_TAKE_ATR_MULT', 4.0))
         # Track highest price since entry (for trailing stop)
         self.high_since_entry = torch.zeros(self.num_envs, device=device)
+        # New for Gen11: Track Peak Equity for Drawdown Penalty
+        self.peak_equity = torch.full((self.num_envs,), self.initial_balance, device=device)
+
         # Simple ATR approximation: rolling volatility (we'll compute per-step)
         self.atr_window = int(getattr(TrainingConfig, 'ATR_WINDOW', 14))
         
@@ -107,6 +110,8 @@ class VectorizedTradingEnv:
         self.prev_equity.fill_(self.initial_balance)
         self.steps_in_position.zero_()
         self.high_since_entry.zero_()
+        # New for Gen11
+        self.peak_equity.fill_(self.initial_balance)
         
         return self._get_observation()
         
@@ -235,9 +240,26 @@ class VectorizedTradingEnv:
         safe_equity_t = torch.clamp(equity_t, min=1e-6)
         reward_lr = torch.log(torch.clamp(equity_tp1 / safe_equity_t, min=1e-6))
         
+        # ===== GEN11: DRAWDOWN PENALTY =====
+        # Update Peak Equity
+        self.peak_equity = torch.maximum(self.peak_equity, equity_tp1)
+        
+        # Calculate Drawdown %
+        current_drawdown = (self.peak_equity - equity_tp1) / self.peak_equity
+        
+        # Quadratic Penalty: Penalize deep drawdowns heavily
+        # If DD is 10%, penalty is 0.1^2 * 10 = 0.1 (Huge!)
+        # With multiplier 4.0: 0.1^2 * 4.0 = 0.04
+        dd_penalty = (current_drawdown ** 2) * 4.0
+        
         # ===== REWARD SCALING: Scale up tiny log-returns for better Q-value spread =====
         # Log-returns are typically -0.001 to +0.001. Scale to -0.1 to +0.1 range.
         rewards = reward_lr * self.reward_scale
+        
+        # Apply Drawdown Penalty
+        rewards -= dd_penalty * self.reward_scale
+        
+        # [Moved Winning Hold Bonus to Gen12 Block below]
         
         # ===== REGIME-AWARE REWARD SHAPING =====
         # Detect bear market: price < SMA(lookback) for this step
@@ -268,15 +290,46 @@ class VectorizedTradingEnv:
             profit_bonus = torch.clamp(sell_pnl_pct[profitable_exits], max=0.10) * self.exit_profit_bonus * 10 * self.reward_scale
             rewards[profitable_exits] += profit_bonus
         
-        # ===== HOLDING LOSS PENALTY: Penalize holding losing positions =====
+        # ===== GEN15: MOMENTUM & TREND FILTERS =====
         if self.in_position.any():
             unrealized_pnl_pct = (current_prices - self.entry_price) / torch.clamp(self.entry_price, min=0.01)
-            losing_positions = self.in_position & (unrealized_pnl_pct < -self.loss_threshold_pct)
+            
+            # 1. UNDERWATER PENALTY (MOMENTUM RULE: CUT LOSERS FAST)
+            # Momentum trades should work immediately. If red, get out.
+            losing_positions = self.in_position & (unrealized_pnl_pct < -0.01) # Allow 1% wiggle 
             if losing_positions.any():
-                # Penalty scales with how long we've been holding the loser
-                hold_time_factor = torch.clamp(self.steps_in_position[losing_positions].float() / 10.0, max=5.0)
-                loss_penalty = self.holding_loss_penalty * hold_time_factor * self.reward_scale
-                rewards[losing_positions] -= loss_penalty
+                hold_time_factor = torch.clamp(1.0 + (self.steps_in_position[losing_positions].float() / 10.0), max=5.0)
+                losses = unrealized_pnl_pct[losing_positions].abs()
+                precision_penalty = (losses ** 2) * 50.0 * hold_time_factor * self.reward_scale
+                rewards[losing_positions] -= precision_penalty
+
+            # 2. MOMENTUM HOLDING BONUS
+            # Only reward holding if we are OUTPERFORMING
+            winning_positions = self.in_position & (unrealized_pnl_pct > 0.01) 
+            if winning_positions.any():
+                 rewards[winning_positions] += 0.005 * self.reward_scale
+
+        # ===== TREND ALIGNMENT PENALTY (Don't Fight the Trend) =====
+        # Detect trend using lookback
+        lookback_step = torch.clamp(self.current_step - self.trend_lookback, min=0)
+        lookback_prices = self.prices[self._row_indices, lookback_step]
+        
+        # Bullish: Price > Lookback (Trend Up)
+        # Bearish: Price < Lookback * 0.98 (Trend Down)
+        is_bullish = current_prices > lookback_prices
+        is_bearish = current_prices < (lookback_prices * 0.98)
+        
+        # PENALIZE: Buying the Dip in a Bear Trend (Falling Knife)
+        # We want to kill the Ep480 behavior of buying crashes.
+        knife_catchers = (effective_actions == 1) & is_bearish
+        if knife_catchers.any():
+            rewards[knife_catchers] -= 0.05 * self.reward_scale # Moderate penalty for fighting trend
+            
+        # REWARD: Buying Breakouts
+        # Buying when price is higher than lookback (Momentum)
+        breakout_buyers = (effective_actions == 1) & is_bullish
+        if breakout_buyers.any():
+             rewards[breakout_buyers] += 0.01 * self.reward_scale
 
         # Small penalty for invalid actions (keeps gradients pointing away from nonsense)
         # Adjusted to -0.000001 (0.1 bps) to minimize impact on PnL visibility while still discouraging invalid moves.
@@ -305,6 +358,7 @@ class VectorizedTradingEnv:
             self.in_position[dones] = False
             self.steps_in_position[dones] = 0
             self.high_since_entry[dones] = 0.0  # Reset trailing stop tracker
+            self.peak_equity[dones] = self.initial_balance # Reset Peak Equity
             # We don't reset total_reward here to track episode, but for RL training loop we just need 'done' flag
             
         next_obs = self._get_observation()

@@ -172,9 +172,9 @@ def load_swing_data(cutoff_date=None, oversample_bear=True, bear_multiplier=3):
     if cutoff_date is None:
         try:
             latest_dt = max(df.index.max() for df in processed_dfs if len(df.index) > 0)
-            cutoff_dt = (pd.to_datetime(latest_dt) - pd.DateOffset(years=2)).normalize()
+            cutoff_dt = (pd.to_datetime(latest_dt) - pd.DateOffset(years=1)).normalize()
             cutoff_date = cutoff_dt.strftime("%Y-%m-%d")
-            print(f"8/2 split: cutoff={cutoff_date}")
+            print(f"9/1 split: cutoff={cutoff_date}")
         except Exception:
             cutoff_date = None
 
