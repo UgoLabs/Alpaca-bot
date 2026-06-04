@@ -22,10 +22,10 @@ models/*.pt
 models/*.pkl
 models/*.h5
 
-# Data cache (large CSV files)
-data_cache/
-data/
-data/historical/
+# Data cache (large CSV files) — /data/ is repo-root only; src/data/ stays tracked
+/data_cache/
+/data/
+/data/historical/
 
 # IDE specific files
 .vscode/

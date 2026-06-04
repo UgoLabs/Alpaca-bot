@@ -154,7 +154,15 @@ def download_test_data(
 
     return test_symbols
 
-def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_mult: float = 3.0, test_start_date: str = None, test_end_date: str = None):
+def load_swing_data(
+    data_dir="data/historical_swing",
+    atr_period: int = 14,
+    atr_mult: float = 3.0,
+    test_start_date: str = None,
+    test_end_date: str = None,
+    exclude_symbols: set = None,
+    include_symbols: set = None,
+):
     print(f"Loading Swing Data from {data_dir}...")
     pattern = os.path.join(data_dir, "*_1D.csv")
     files = glob.glob(pattern)
@@ -174,8 +182,13 @@ def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_
     
     for f in tqdm(files, desc="Processing CSVs"):
         try:
+            ticker = os.path.basename(f).replace("_1D.csv", "").upper()
+            if exclude_symbols and ticker in exclude_symbols:
+                continue
+            if include_symbols is not None and ticker not in include_symbols:
+                continue
+            
             df = pd.read_csv(f)
-            ticker = os.path.basename(f).replace("_1D.csv", "")
             
             # Standardize Columns
             df.columns = [c.lower() for c in df.columns]
@@ -243,18 +256,16 @@ def load_swing_data(data_dir="data/historical_swing", atr_period: int = 14, atr_
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         raw_atr = tr.rolling(window=14).mean().fillna(0).values
         
+        # Must match the 11 features the production swing model was trained on and
+        # that the live pipeline (src/data/pipeline.py SWING_FEATURE_COLS) feeds it.
+        # The old 25-feature set built a 25-dim net that fails to load gen7 (11-dim).
         feature_cols = [
-            'sma_10', 'sma_20', 'sma_50', 'sma_200', 
-            'atr', 'bb_width', 'bb_upper', 'bb_lower', 
-            'ema_12', 'ema_26', 
-            'macd', 'macd_signal', 'macd_diff', 
-            'adx', 'rsi', 'stoch_k', 'stoch_d', 
-            'williams_r', 'roc', 'bb_pband', 
-            'volume_sma', 'volume_ratio', 'obv', 'mfi', 'price_vs_sma20'
+            'Open', 'High', 'Low', 'Close', 'Volume',
+            'rsi', 'macd', 'macd_signal', 'adx', 'sma_20', 'ema_12',
         ]
         
         valid_cols = [c for c in feature_cols if c in df.columns]
-        if len(valid_cols) < 25:
+        if len(valid_cols) < len(feature_cols):
             continue
             
         features = df[feature_cols].values
@@ -305,15 +316,19 @@ def run_backtest(
     test_start_date: str = None,
     test_end_date: str = None,
     visualize: bool = False,
+    confidence_threshold: float = 0.0,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Starting Swing Bot Backtest on {device}...")
     
     data_dir = "data/historical_swing"
+    exclude_symbols = set()
     if test_generalization:
         print("MODE: Generalization Test (Unseen Symbols)")
         data_dir = "data/test_swing"
         download_test_data(data_dir, test_count=test_count, period=period, interval="1d", seed=seed)
+        # Collect symbols that were in training data to exclude them if they exist in test_swing
+        exclude_symbols = _collect_known_symbols()
     
     # 1. Load Data
     data, prices, stop_prices, atr_values, tickers = load_swing_data(
@@ -321,7 +336,8 @@ def run_backtest(
         atr_period=atr_period, 
         atr_mult=atr_mult,
         test_start_date=test_start_date,
-        test_end_date=test_end_date
+        test_end_date=test_end_date,
+        exclude_symbols=exclude_symbols
     )
     if data is None:
         return
@@ -387,10 +403,19 @@ def run_backtest(
     total_reward = 0.0
     forced_sells = 0
     forced_profit_sells = 0
+    gated_buys = 0
+
+    if confidence_threshold > 0:
+        print(f"Confidence gating: BUYs require confidence >= {confidence_threshold:.2f}")
     
     # Track actions
     action_counts = {0: 0, 1: 0, 2: 0} # Hold, Buy, Sell
     all_realized_pnls = []
+    
+    # === EQUITY CURVE TRACKING ===
+    # Track aggregate portfolio equity over time (sum of all envs)
+    equity_curve = []
+    initial_total_equity = float(env.initial_balance * env.num_envs)
     
     # Visualization Setup
     viz_indices = []
@@ -412,7 +437,15 @@ def run_backtest(
 
     for step in tqdm(range(total_steps), desc="Backtesting"):
         with torch.no_grad():
-            actions = agent.batch_act(state, dummy_text_ids, dummy_text_mask)
+            if confidence_threshold > 0:
+                actions, conf = agent.batch_act(state, dummy_text_ids, dummy_text_mask, return_confidence=True)
+                # Mirror live gating: skip BUYs the agent isn't confident enough about.
+                actions = actions.clone()
+                low_conf_buy = (actions == 1) & (conf < confidence_threshold)
+                actions[low_conf_buy] = 0  # downgrade to HOLD
+                gated_buys += int(low_conf_buy.sum().item())
+            else:
+                actions = agent.batch_act(state, dummy_text_ids, dummy_text_mask)
 
         # Optional: enforce trailing stop exits by overriding actions
         if use_trailing_stop or use_profit_take:
@@ -451,6 +484,13 @@ def run_backtest(
                 viz_data[idx]['actions'].append(actions_cpu[idx])
 
         next_state, rewards, dones, infos = env.step(actions)
+
+        # === TRACK EQUITY ===
+        with torch.no_grad():
+            row_idx = torch.arange(env.num_envs, device=device)
+            cur_prices = env.prices[row_idx, env.current_step]
+            total_equity = (env.balance + env.shares * cur_prices).sum().item()
+            equity_curve.append(total_equity)
 
         # Track PnL
         if 'realized_pnl' in infos:
@@ -507,10 +547,29 @@ def run_backtest(
         print(f"Forced Sells (Trailing Stop): {forced_sells}")
     if use_profit_take:
         print(f"Forced Sells (Profit Take): {forced_profit_sells}")
+    if confidence_threshold > 0:
+        print(f"Gated BUYs (below confidence {confidence_threshold:.2f}): {gated_buys}")
 
     avg_reward = total_reward / max(1, env.num_envs)
     print(f"Total Reward (Sum): {total_reward:.4f}")
     print(f"Average Reward per Symbol: {avg_reward:.6f}")
+    
+    # === EQUITY CURVE SUMMARY ===
+    if equity_curve:
+        final_total_equity = equity_curve[-1]
+        total_return_pct = ((final_total_equity - initial_total_equity) / initial_total_equity) * 100
+        
+        # Per-symbol averages (divide by num_envs)
+        per_symbol_start = env.initial_balance
+        per_symbol_end = final_total_equity / env.num_envs
+        per_symbol_return_pct = ((per_symbol_end - per_symbol_start) / per_symbol_start) * 100
+        per_symbol_dollar_gain = per_symbol_end - per_symbol_start
+        
+        print(f"\nEquity Curve Summary (Starting: ${env.initial_balance:,.0f} per symbol):")
+        print(f"  Final Equity (per symbol avg): ${per_symbol_end:,.2f}")
+        print(f"  Dollar Gain (per symbol avg):  ${per_symbol_dollar_gain:+,.2f}")
+        print(f"  Return (per symbol avg):       {per_symbol_return_pct:+.2f}%")
+        print(f"  Total Portfolio Return:        {total_return_pct:+.2f}%")
     
     if visualize:
         print("\nGenerating Plots...")
@@ -594,9 +653,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-profit-take", action="store_true", help="Force SELL when price reaches ATR-based profit target")
     parser.add_argument("--profit-atr-mult", type=float, default=4.0, help="Profit ATR multiplier (entry + ATR * mult)")
     parser.add_argument("--position-pct", type=float, default=1.0, help="Fraction of cash to deploy per BUY (default 1.0=all-in)")
-    parser.add_argument("--test-start-date", type=str, default=None, help="Start date for backtesting (YYYY-MM-DD)")
+    parser.add_argument("--test-start-date", type=str, default="2024-01-01", help="Start date for backtesting (YYYY-MM-DD)")
     parser.add_argument("--test-end-date", type=str, default=None, help="End date for backtesting (YYYY-MM-DD)")
     parser.add_argument("--visualize", action="store_true", help="Generate plots for a few random symbols")
+    parser.add_argument("--confidence-threshold", type=float, default=0.0, help="Skip BUYs below this confidence (mirrors live CONFIDENCE_THRESHOLD; 0=off)")
 
     args = parser.parse_args()
 
@@ -615,4 +675,5 @@ if __name__ == "__main__":
         test_start_date=args.test_start_date,
         test_end_date=args.test_end_date,
         visualize=args.visualize,
+        confidence_threshold=args.confidence_threshold,
     )

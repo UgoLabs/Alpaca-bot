@@ -154,7 +154,8 @@ class EnsembleAgent:
             return final_actions[0].item()
         return final_actions
 
-    def batch_act(self, ts_state, text_ids, text_mask, in_position=None, sell_bias=0.15):
+    def batch_act(self, ts_state, text_ids, text_mask, in_position=None, sell_bias=0.15,
+                  return_confidence=False, ablation=None):
         """
         Batch inference with CONTEXT-AWARE voting.
         
@@ -162,6 +163,10 @@ class EnsembleAgent:
         1. Aggressive agent has more weight on BUY decisions
         2. Conservative agent has more weight on SELL decisions  
         3. sell_bias: probability to randomly explore SELL action (helps learn exits)
+
+        return_confidence: if True, also returns a (Batch,) confidence tensor =
+            softmax(avg_Q / temperature) probability of the chosen action, matching
+            the live act() confidence used by CONFIDENCE_THRESHOLD gating.
         """
         batch_size = ts_state.shape[0]
         all_actions = []
@@ -185,9 +190,9 @@ class EnsembleAgent:
                     use_autocast = isinstance(self.device, str) and self.device.startswith("cuda")
                     if use_autocast:
                         with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            q_vals = agent.policy_net(ts_state, text_ids, text_mask)
+                            q_vals = agent.policy_net(ts_state, text_ids, text_mask, ablation=ablation)
                     else:
-                        q_vals = agent.policy_net(ts_state, text_ids, text_mask)
+                        q_vals = agent.policy_net(ts_state, text_ids, text_mask, ablation=ablation)
                     actions = q_vals.argmax(dim=1)
                     all_q_vals.append(q_vals)
             all_actions.append(actions)
@@ -220,6 +225,18 @@ class EnsembleAgent:
         confident = max_w >= 1.5
         final_actions[confident] = argmax[confident]
         final_actions[force_sell] = 2
+
+        if return_confidence:
+            # Softmax confidence over the 3-agent averaged Q-values (temp matches act()).
+            if len(all_q_vals) == 3:
+                q_avg = torch.stack(all_q_vals, dim=0).float().mean(dim=0)  # (Batch, action_dim)
+                temperature = 0.01
+                softmax_probs = torch.softmax(q_avg / temperature, dim=1)
+                conf = softmax_probs.gather(1, final_actions.unsqueeze(1)).squeeze(1)
+            else:
+                # An agent took the epsilon path (no Q); confidence undefined -> 1.0 (don't gate).
+                conf = torch.ones(batch_size, device=self.device)
+            return final_actions, conf
 
         return final_actions
 

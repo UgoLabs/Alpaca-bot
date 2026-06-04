@@ -227,6 +227,81 @@ def add_technical_indicators(df):
     return df
 
 
+# Canonical intraday (day-trading) feature set used by training, backtest, and
+# live inference. Keep this list in ONE place so the three paths never drift.
+# 15 features: 5 raw OHLCV + 10 intraday-predictive signals.
+DAY_FEATURE_COLS = [
+    'Open', 'High', 'Low', 'Close', 'Volume',
+    'ret_1', 'ret_4', 'vwap_dist', 'rel_volume', 'atr_pct',
+    'rsi', 'macd_diff', 'bb_pband', 'tod_sin', 'tod_cos',
+]
+
+_EASTERN_TZ = "America/New_York"
+
+
+def add_intraday_features(df):
+    """Add intraday-specific features on top of add_technical_indicators().
+
+    These are the signals that actually carry edge on 15-minute bars (unlike the
+    daily-oriented SMAs the model was choking on). All are computable identically
+    in training (tz-naive UTC CSV index) and live (tz-aware UTC Alpaca index):
+
+      - ret_1 / ret_4 : 1-bar and 4-bar (~1h) momentum
+      - vwap_dist     : distance from the SESSION-anchored VWAP (resets each day)
+      - rel_volume    : volume vs its trailing 26-bar (~1 session) average
+      - atr_pct       : ATR normalized by price (volatility regime)
+      - tod_sin/cos   : cyclical time-of-day in US/Eastern (DST-safe seasonality)
+
+    Assumes add_technical_indicators() already ran (needs 'atr'; rsi/macd_diff/
+    bb_pband come from there too and are listed in DAY_FEATURE_COLS).
+    """
+    df = df.copy()
+
+    close = df['Close'] if 'Close' in df.columns else pd.Series(np.zeros(len(df)), index=df.index)
+    high = df['High'] if 'High' in df.columns else close
+    low = df['Low'] if 'Low' in df.columns else close
+    volume = df['Volume'] if 'Volume' in df.columns else pd.Series(np.zeros(len(df)), index=df.index)
+
+    # --- Momentum / returns ---
+    df['ret_1'] = close.pct_change(1, fill_method=None).fillna(0.0)
+    df['ret_4'] = close.pct_change(4, fill_method=None).fillna(0.0)
+
+    # --- Time-of-day (US/Eastern, DST-safe) + session bucket for VWAP anchor ---
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        eastern = idx.tz_localize('UTC').tz_convert(_EASTERN_TZ) if idx.tz is None \
+            else idx.tz_convert(_EASTERN_TZ)
+        tod_frac = (eastern.hour * 60 + eastern.minute) / (24.0 * 60.0)
+        df['tod_sin'] = np.sin(2.0 * np.pi * tod_frac)
+        df['tod_cos'] = np.cos(2.0 * np.pi * tod_frac)
+        session = pd.Series(eastern.normalize().values, index=df.index)
+    else:
+        df['tod_sin'] = 0.0
+        df['tod_cos'] = 1.0
+        session = pd.Series(np.zeros(len(df)), index=df.index)
+
+    # --- Session-anchored VWAP distance (resets each trading day) ---
+    typical = (high + low + close) / 3.0
+    tp_vol = typical * volume
+    cum_tpv = tp_vol.groupby(session).cumsum()
+    cum_vol = volume.groupby(session).cumsum().replace(0, np.nan)
+    vwap = (cum_tpv / cum_vol).ffill().bfill()
+    df['vwap_dist'] = ((close - vwap) / vwap.replace(0, np.nan)).fillna(0.0)
+
+    # --- Relative volume vs trailing ~1 session ---
+    vol_ma = volume.rolling(window=26, min_periods=1).mean().replace(0, np.nan)
+    df['rel_volume'] = (volume / vol_ma).fillna(1.0)
+
+    # --- ATR as a fraction of price ---
+    if 'atr' in df.columns:
+        df['atr_pct'] = (df['atr'] / close.replace(0, np.nan)).fillna(0.0)
+    else:
+        df['atr_pct'] = 0.0
+
+    df = df.replace([np.inf, -np.inf], 0.0)
+    return df
+
+
 def detect_market_regime(df, current_step):
     """
     Detect the current market regime with faster reaction and chop detection.

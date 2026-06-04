@@ -1,0 +1,21 @@
+# Short options backtest universe — liquid mega-caps + index ETFs (option volume).
+AAPL
+MSFT
+NVDA
+AMZN
+GOOGL
+META
+TSLA
+AMD
+AVGO
+SPY
+QQQ
+JPM
+BAC
+NFLX
+DIS
+WMT
+UNH
+GS
+ORCL
+CRM
