@@ -57,11 +57,14 @@ class MultiModalAgent(nn.Module):
             nn.Linear(64, action_dim)
         )
 
-    def forward(self, ts_data, text_input_ids, text_attention_mask):
+    def forward(self, ts_data, text_input_ids, text_attention_mask, ablation=None):
         """
         ts_data: (Batch, Window, Features)
         text_input_ids: (Batch, Seq_Len)
         text_attention_mask: (Batch, Seq_Len)
+        ablation: None | "full" | "no_text" | "no_vision" | "ts_only"
+            Used for backtests: ts_only = price-series transformer only (zero vision+text).
+            no_text matches production training (dummy zero text ids).
         """
         
         # 1. Get Time-Series Embedding
@@ -84,6 +87,12 @@ class MultiModalAgent(nn.Module):
         
         # 3. Get Text Embedding
         text_emb = self.text_head(text_input_ids, text_attention_mask) # (Batch, d_model)
+
+        mode = (ablation or "full").lower()
+        if mode in ("no_text", "ts_only"):
+            text_emb = torch.zeros_like(text_emb)
+        if mode in ("no_vision", "ts_only"):
+            vision_emb = torch.zeros_like(vision_emb)
         
         # 4. Fusion
         combined = torch.cat([ts_emb, vision_emb, text_emb], dim=1)

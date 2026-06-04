@@ -70,6 +70,22 @@ class VectorizedTradingEnv:
         # Reward scaling for better Q-value spread
         self.reward_scale = float(getattr(TrainingConfig, 'REWARD_SCALE', 100.0))  # Scale up tiny log-returns
 
+        # Configurable shaping knobs (defaults preserve prior swing/crypto behavior).
+        # flat_downtrend_bonus: per-step reward for sitting flat during a downtrend.
+        #   On intraday (15Min) data this MUST be near-zero, otherwise the agent
+        #   learns to never buy (it gets paid to stay in cash). Swing keeps 0.01.
+        # invalid_action_penalty: cost for no-op actions (SELL while flat / BUY while
+        #   in position). Too small => agent spams SELL as a free no-op.
+        self.flat_downtrend_bonus = float(getattr(TrainingConfig, 'FLAT_DOWNTREND_BONUS', 0.01))
+        self.invalid_action_penalty = float(getattr(TrainingConfig, 'INVALID_ACTION_PENALTY', 0.000001))
+
+        # Entry-quality reward (privileged look-ahead, TRAINING ONLY).
+        # Rewards a BUY by its net forward return over the next N bars so the agent
+        # gets a dense gradient toward profitable entries instead of learning to
+        # never trade. Default coef 0.0 => disabled (swing/crypto unchanged).
+        self.entry_reward_coef = float(getattr(TrainingConfig, 'ENTRY_REWARD_COEF', 0.0))
+        self.entry_lookahead = int(getattr(TrainingConfig, 'ENTRY_LOOKAHEAD_BARS', 6))
+
         # ===== TRAILING STOP & PROFIT-TAKE (applied during training) =====
         # DISABLED for training - let the model learn exit timing itself
         # These can be enabled in backtest/production for risk management
@@ -144,8 +160,13 @@ class VectorizedTradingEnv:
         invalid_sell_flat = (actions == 2) & (~self.in_position)
         invalid_buy_in_pos = (actions == 1) & (self.in_position)
 
-        # ===== TRAILING STOP & PROFIT-TAKE: Force SELL if triggered =====
+        # ===== FORCED EXITS (time stop, trailing, profit-take) =====
         forced_sell_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        max_hold = int(getattr(TrainingConfig, "MAX_HOLD_BARS", 0) or 0)
+        if max_hold > 0 and self.in_position.any():
+            time_stop = self.in_position & (self.steps_in_position >= max_hold)
+            forced_sell_mask = forced_sell_mask | time_stop
+
         if self.in_position.any() and (self.use_trailing_stop or self.use_profit_take):
             # Update high_since_entry for trailing stop
             self.high_since_entry[self.in_position] = torch.maximum(
@@ -260,7 +281,7 @@ class VectorizedTradingEnv:
             # HOLD when flat in downtrend = correctly avoided buying the dip too early
             smart_hold = (effective_actions == 0) & (~self.in_position) & in_downtrend
             if smart_hold.any():
-                rewards[smart_hold] += 0.01 * self.reward_scale  # Small bonus for patience
+                rewards[smart_hold] += self.flat_downtrend_bonus * self.reward_scale  # Bonus for patience
         
         # ===== EXIT REWARD SHAPING: Bonus for profitable exits =====
         profitable_exits = sell_mask & (sell_pnl_pct > 0)
@@ -278,12 +299,23 @@ class VectorizedTradingEnv:
                 loss_penalty = self.holding_loss_penalty * hold_time_factor * self.reward_scale
                 rewards[losing_positions] -= loss_penalty
 
+        # ===== ENTRY-QUALITY REWARD: reward BUYs by their net forward return =====
+        # Privileged look-ahead used ONLY in training. The policy still only sees
+        # past data at inference; this just shapes WHERE to enter. Disabled when
+        # entry_reward_coef == 0 (default), so swing/crypto behavior is unchanged.
+        if self.entry_reward_coef != 0.0 and buy_mask.any():
+            fwd_step = torch.clamp(self.current_step + self.entry_lookahead, max=self.total_steps - 1)
+            fwd_prices = self.prices[self._row_indices, fwd_step]
+            fwd_ret = (fwd_prices - current_prices) / torch.clamp(current_prices, min=1e-6)
+            fwd_ret_net = fwd_ret - (2.0 * self._total_cost_rate)  # must beat round-trip cost
+            rewards[buy_mask] += self.entry_reward_coef * fwd_ret_net[buy_mask] * self.reward_scale
+
         # Small penalty for invalid actions (keeps gradients pointing away from nonsense)
         # Adjusted to -0.000001 (0.1 bps) to minimize impact on PnL visibility while still discouraging invalid moves.
         if invalid_sell_flat.any():
-            rewards[invalid_sell_flat] -= 0.000001
+            rewards[invalid_sell_flat] -= self.invalid_action_penalty
         if invalid_buy_in_pos.any():
-            rewards[invalid_buy_in_pos] -= 0.000001
+            rewards[invalid_buy_in_pos] -= self.invalid_action_penalty
         
         # 3. Step Time
         self.current_step += 1
