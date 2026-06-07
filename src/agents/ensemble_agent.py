@@ -155,7 +155,7 @@ class EnsembleAgent:
         return final_actions
 
     def batch_act(self, ts_state, text_ids, text_mask, in_position=None, sell_bias=0.15,
-                  return_confidence=False, ablation=None):
+                  return_confidence=False, ablation=None, confidence_temperature=0.01):
         """
         Batch inference with CONTEXT-AWARE voting.
         
@@ -167,6 +167,12 @@ class EnsembleAgent:
         return_confidence: if True, also returns a (Batch,) confidence tensor =
             softmax(avg_Q / temperature) probability of the chosen action, matching
             the live act() confidence used by CONFIDENCE_THRESHOLD gating.
+
+        confidence_temperature: softmax temperature for the confidence value only
+            (does NOT change action selection, which is argmax/voting). The historical
+            default 0.01 saturates the softmax to a near-hard argmax (~1.0 for almost
+            every pick). Larger values spread confidence out so the threshold is
+            informative. Kept at 0.01 by default to preserve swing/day backtest parity.
         """
         batch_size = ts_state.shape[0]
         all_actions = []
@@ -230,7 +236,7 @@ class EnsembleAgent:
             # Softmax confidence over the 3-agent averaged Q-values (temp matches act()).
             if len(all_q_vals) == 3:
                 q_avg = torch.stack(all_q_vals, dim=0).float().mean(dim=0)  # (Batch, action_dim)
-                temperature = 0.01
+                temperature = max(1e-6, float(confidence_temperature))
                 softmax_probs = torch.softmax(q_avg / temperature, dim=1)
                 conf = softmax_probs.gather(1, final_actions.unsqueeze(1)).squeeze(1)
             else:
@@ -250,6 +256,10 @@ class EnsembleAgent:
     def freeze_feature_extractors(self):
         for agent in self.agents:
             agent.freeze_feature_extractors()
+
+    def clear_memory(self):
+        for agent in self.agents:
+            agent.clear_memory()
 
     def unfreeze_all(self):
         for agent in self.agents:

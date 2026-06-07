@@ -7,7 +7,7 @@ Usage:
     python manage.py status   # Check what's running & view latest logs
     python manage.py train    # Start GPU Training (Hidden Mode)
     python manage.py stop     # Stop Training
-    python manage.py run [mode] # Start Trading Bot (swing, day, crypto)
+    python manage.py run [mode] # Start Trading Bot (swing, paper_swing, options)
     python manage.py clean    # Clean logs and pycache
 """
 import os
@@ -397,7 +397,7 @@ def clean_workspace():
 
 def run_bot(mode):
     """Launch the trading bot in the specified mode."""
-    valid_modes = ['swing', 'day', 'crypto']
+    valid_modes = ['swing', 'paper_swing', 'options']
     if mode not in valid_modes:
         print(f"❌ Invalid mode: {mode}")
         print(f"   Available modes: {', '.join(valid_modes)}")
@@ -439,12 +439,12 @@ def main():
     elif action == 'run':
         if len(sys.argv) < 3:
             # check if --mode was passed? No, simplify: python manage.py run swing
-            print("❌ Missing mode. Usage: python manage.py run <swing|day|crypto>")
+            print("❌ Missing mode. Usage: python manage.py run <swing|paper_swing|options>")
             return
         mode_arg = sys.argv[2]
         run_bot(mode_arg)
     # Allow shortcuts: python manage.py swing
-    elif action in ['swing', 'day', 'crypto']:
+    elif action in ['swing', 'paper_swing', 'options']:
         run_bot(action)
     elif action == '--mode':
          # Handle the user's specific attempt: python manage.py --mode swing

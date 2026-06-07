@@ -119,3 +119,6 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return self.tree.count
+
+    def clear(self):
+        self.tree = SumTree(self.tree.capacity)

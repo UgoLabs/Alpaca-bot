@@ -33,6 +33,13 @@ WINDOW = 60
 DEFAULT_WATCHLIST = os.path.join("config", "watchlists", "swing_liquid.txt")
 
 
+def _select_device() -> str:
+    """cuda if available, unless BT_FORCE_CPU is set (avoids contending with GPU training)."""
+    if os.getenv("BT_FORCE_CPU", "").strip().lower() in ("1", "true", "yes"):
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _load_watchlist_symbols(path: str | None) -> set | None:
     if not path or not os.path.exists(path):
         return None
@@ -110,6 +117,7 @@ class Portfolio:
         self.trade_pnls = []
         self.hold_lengths = []
         self.n_buys = 0
+        self.position_counts = []  # concurrent holdings after each bar
 
     def _sell(self, idx, px, step):
         proceeds = self.shares[idx] * px * (1.0 - self.cost)
@@ -169,6 +177,7 @@ class Portfolio:
                 self.held.add(idx)
                 self.entry_step[idx] = t
                 self.n_buys += 1
+        self.position_counts.append(len(self.held))
         self.equity_curve.append(self.cash + float((self.shares * px_t).sum()))
 
     def metrics(self):
@@ -184,18 +193,45 @@ class Portfolio:
         max_dd = ((eq - run_max) / run_max).min() * 100
         pnls = np.array(self.trade_pnls)
         wr = (pnls > 0).mean() * 100 if len(pnls) else 0.0
+        counts = np.array(self.position_counts, dtype=float) if self.position_counts else np.array([0.0])
+        max_held = int(counts.max()) if len(counts) else 0
+        avg_held = float(counts.mean()) if len(counts) else 0.0
+        pct_at_cap = float((counts >= self.max_positions).mean() * 100) if len(counts) else 0.0
+        util = float((counts / max(1, self.max_positions)).mean() * 100) if len(counts) else 0.0
         return {
             "final": eq[-1], "total_ret": total_ret * 100, "cagr": cagr * 100,
             "max_dd": max_dd, "sharpe": sharpe, "trades": len(pnls), "wr": wr,
             "avg_trade": pnls.mean() * 100 if len(pnls) else 0.0,
             "avg_hold": np.mean(self.hold_lengths) if self.hold_lengths else 0.0,
             "buys": self.n_buys,
+            "max_held": max_held,
+            "avg_held": avg_held,
+            "pct_at_cap": pct_at_cap,
+            "slot_util_pct": util,
         }
 
 
-def _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path=None, ablation=None):
-    """Load data + run agent inference once; return signals and prices for reuse."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def _normalize_model_prefix(path: str) -> str:
+    """Ensemble checkpoints are saved as {prefix}_{aggressive|conservative|balanced}.pth."""
+    path = str(path).replace("\\", "/")
+    for suf in ("_balanced.pth", "_aggressive.pth", "_conservative.pth"):
+        if path.endswith(suf):
+            return path[: -len(suf)]
+    return path
+
+
+def _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path=None, ablation=None,
+                    confidence_temperature=0.01):
+    """Load data + run agent inference once; return signals and prices for reuse.
+
+    confidence_temperature only rescales the returned confidence (action selection
+    is unchanged). Default 0.01 preserves validated swing parity; pass a larger
+    value to spread confidence for options or a swing temperature re-sweep.
+    """
+    model_prefix = _normalize_model_prefix(model_path)
+    if model_prefix != str(model_path).replace("\\", "/"):
+        print(f"  Model prefix: {model_prefix}")
+    device = _select_device()
     include = _load_watchlist_symbols(watchlist_path)
     data, prices, _stop, _atr, tickers = load_swing_data(
         "data/historical_swing",
@@ -213,7 +249,7 @@ def _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path=N
     active = torch.cummax(changed.int(), dim=1).values.bool()
 
     agent = EnsembleAgent(time_series_dim=F, vision_channels=F, action_dim=3, device=device)
-    agent.load(model_path)
+    agent.load(model_prefix)
     for sa in agent.agents:
         sa.epsilon = 0.0
         sa.policy_net.eval()
@@ -229,6 +265,7 @@ def _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path=N
         with torch.no_grad():
             actions, conf = agent.batch_act(
                 obs, dummy_ids, dummy_mask, return_confidence=True, ablation=ablation,
+                confidence_temperature=confidence_temperature,
             )
         actions_all[t] = actions.detach().cpu().numpy()
         conf_all[t] = conf.detach().cpu().numpy()
@@ -495,11 +532,16 @@ def sweep_sell(model_path, test_start_date, test_end_date, capital, cost_per_sid
 
 def sweep(model_path, test_start_date, test_end_date, capital, cost_per_side,
           slots_grid, conf_grid, benchmark="SPY", watchlist_path=None, spy_fear_block_pct=None,
-          **portfolio_extras):
+          sell_confidence_threshold=None, **portfolio_extras):
     sig = _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path)
     if sig is None:
         print("No data.")
         return
+    sell_conf = (
+        float(sell_confidence_threshold)
+        if sell_confidence_threshold is not None
+        else float(SwingTraderConfig.SELL_CONFIDENCE_THRESHOLD)
+    )
     T, N = sig["T"], sig["N"]
     bench_ret = None
     if benchmark in sig["tickers"]:
@@ -512,7 +554,10 @@ def sweep(model_path, test_start_date, test_end_date, capital, cost_per_side,
     configs = [(s, c) for s in slots_grid for c in conf_grid]
     extras = _portfolio_extras(**portfolio_extras)
     ports = {
-        (s, c): Portfolio(capital, s, c, cost_per_side, 0.0, N, **extras)
+        (s, c): Portfolio(
+            capital, s, c, cost_per_side, 0.0, N,
+            sell_confidence_threshold=sell_conf, **extras,
+        )
         for (s, c) in configs
     }
     for t in range(WINDOW, T):
@@ -542,6 +587,157 @@ def sweep(model_path, test_start_date, test_end_date, capital, cost_per_side,
     print("=" * 86)
 
 
+def sweep_slots(model_path, test_start_date, test_end_date, capital, cost_per_side,
+                slots_grid, confidence_threshold, sell_confidence_threshold,
+                benchmark="SPY", watchlist_path=None, spy_fear_block_pct=None,
+                **portfolio_extras):
+    """Sweep MAX_POSITIONS at fixed live buy/sell; reports slot utilization (concurrent holdings)."""
+    sig = _load_and_infer(model_path, test_start_date, test_end_date, watchlist_path)
+    if sig is None:
+        print("No data.")
+        return
+    T, N = sig["T"], sig["N"]
+    bench_ret = None
+    if benchmark in sig["tickers"]:
+        bi = sig["tickers"].index(benchmark)
+        bs = sig["prices"][bi, WINDOW:]
+        bs = bs[bs > 0]
+        if len(bs) > 1:
+            bench_ret = bs[-1] / bs[0] - 1.0
+
+    extras = _portfolio_extras(**portfolio_extras)
+    ports = {
+        s: Portfolio(
+            capital, s, confidence_threshold, cost_per_side, 0.0, N,
+            sell_confidence_threshold=sell_confidence_threshold, **extras,
+        )
+        for s in slots_grid
+    }
+    for t in range(WINDOW, T):
+        a = sig["actions"][t]
+        cf = sig["conf"][t]
+        px = sig["prices"][:, t]
+        act = sig["active"][:, t]
+        block = False
+        if spy_fear_block_pct is not None:
+            block = _spy_day_change_pct(sig["prices"], sig["tickers"], t) < float(spy_fear_block_pct)
+        for p in ports.values():
+            p.step(t, a, cf, px, act, block_new_buys=block)
+
+    print("\n" + "=" * 104)
+    hdr = (f"SLOTS SWEEP  buy>={confidence_threshold:.2f}  sell>={sell_confidence_threshold:.2f}  "
+           f"(start {test_start_date}, cost {cost_per_side*100:.3f}%/side")
+    if bench_ret is not None:
+        hdr += f", SPY {bench_ret*100:+.2f}%)"
+    else:
+        hdr += ")"
+    print(hdr)
+    print("  maxHeld = peak concurrent positions | avgHeld = mean | util% = avgHeld/slots | atCap% = bars at full")
+    print("-" * 104)
+    print(f"{'slots':>5} {'totRet%':>8} {'Sharpe':>7} {'maxDD%':>8} {'trades':>7} "
+          f"{'maxHeld':>7} {'avgHeld':>7} {'util%':>6} {'atCap%':>6} {'alpha%':>7}")
+
+    rows = []
+    for s in slots_grid:
+        m = ports[s].metrics()
+        if not m:
+            continue
+        alpha = (m["total_ret"] - bench_ret * 100) if bench_ret is not None else float("nan")
+        rows.append((s, m, alpha))
+
+    for s, m, alpha in rows:
+        print(
+            f"{s:>5} {m['total_ret']:>8.2f} {m['sharpe']:>7.2f} {m['max_dd']:>8.2f} "
+            f"{m['trades']:>7d} {m['max_held']:>7d} {m['avg_held']:>7.1f} "
+            f"{m['slot_util_pct']:>6.1f} {m['pct_at_cap']:>6.1f} {alpha:>7.2f}"
+        )
+    print("=" * 104)
+    if rows:
+        best_ret = max(rows, key=lambda r: r[1]["total_ret"])
+        best_util = max(rows, key=lambda r: r[1]["max_held"])
+        print(
+            f"Best return: {best_ret[0]} slots ({best_ret[1]['total_ret']:+.2f}%, "
+            f"maxHeld {best_ret[1]['max_held']}/{best_ret[0]})"
+        )
+        print(
+            f"Peak concurrent positions (any slot cap): {best_util[1]['max_held']} "
+            f"at {best_util[0]}-slot config"
+        )
+
+
+def sweep_temp(model_path, test_start_date, test_end_date, capital, cost_per_side,
+               temp_grid, conf_grid, max_positions, sell_confidence_threshold,
+               benchmark="SPY", watchlist_path=None, spy_fear_block_pct=None,
+               **portfolio_extras):
+    """Swing temperature re-sweep: temp x buy-conf at fixed slots/sell vs validated 0.01/0.70.
+
+    Confidence depends on temperature, so we re-infer once per temperature, then run the
+    buy-conf grid (cheap) on each. Use to check whether any (temp, threshold) beats the
+    validated (temp 0.01, buy 0.70, sell 0.35, 40 slots) swing config.
+    """
+    extras = _portfolio_extras(**portfolio_extras)
+    bench_ret = None
+    rows = []
+    for temp in temp_grid:
+        sig = _load_and_infer(
+            model_path, test_start_date, test_end_date, watchlist_path,
+            confidence_temperature=temp,
+        )
+        if sig is None:
+            print(f"  temp {temp}: no data.")
+            continue
+        T, N = sig["T"], sig["N"]
+        if bench_ret is None and benchmark in sig["tickers"]:
+            bi = sig["tickers"].index(benchmark)
+            bs = sig["prices"][bi, WINDOW:]
+            bs = bs[bs > 0]
+            if len(bs) > 1:
+                bench_ret = bs[-1] / bs[0] - 1.0
+        ports = {
+            c: Portfolio(capital, max_positions, c, cost_per_side, 0.0, N,
+                         sell_confidence_threshold=sell_confidence_threshold, **extras)
+            for c in conf_grid
+        }
+        for t in range(WINDOW, T):
+            a = sig["actions"][t]
+            cf = sig["conf"][t]
+            px = sig["prices"][:, t]
+            act = sig["active"][:, t]
+            block = False
+            if spy_fear_block_pct is not None:
+                block = _spy_day_change_pct(sig["prices"], sig["tickers"], t) < float(spy_fear_block_pct)
+            for p in ports.values():
+                p.step(t, a, cf, px, act, block_new_buys=block)
+        for c in conf_grid:
+            m = ports[c].metrics()
+            if not m:
+                continue
+            alpha = (m["total_ret"] - bench_ret * 100) if bench_ret is not None else float("nan")
+            rows.append((temp, c, m, alpha))
+
+    print("\n" + "=" * 92)
+    head = (f"SWING TEMPERATURE RE-SWEEP  (start {test_start_date}, slots {max_positions}, "
+            f"sell>={sell_confidence_threshold:.2f}, cost {cost_per_side*100:.3f}%/side")
+    if bench_ret is not None:
+        head += f", SPY {bench_ret*100:+.2f}%)"
+    else:
+        head += ")"
+    print(head)
+    print("-" * 92)
+    print(f"{'temp':>6} {'conf':>5} {'totRet%':>8} {'CAGR%':>7} {'maxDD%':>8} "
+          f"{'Sharpe':>7} {'trades':>7} {'win%':>6} {'avgT%':>7} {'alpha%':>7}")
+    rows.sort(key=lambda r: r[2]["total_ret"], reverse=True)
+    for temp, c, m, alpha in rows:
+        print(f"{temp:>6.3f} {c:>5.2f} {m['total_ret']:>8.2f} {m['cagr']:>7.2f} "
+              f"{m['max_dd']:>8.2f} {m['sharpe']:>7.2f} {m['trades']:>7d} {m['wr']:>6.1f} "
+              f"{m['avg_trade']:>7.2f} {alpha:>7.2f}")
+    print("=" * 92)
+    if rows:
+        b = rows[0]
+        print(f"Best: temp {b[0]:.3f} / buy {b[1]:.2f} -> {b[2]['total_ret']:+.2f}% "
+              f"(Sharpe {b[2]['sharpe']:.2f}, maxDD {b[2]['max_dd']:.2f}%)")
+
+
 def run(
     model_path="models/swing_gen7_refined_ep380",
     test_start_date="2024-01-01",
@@ -560,7 +756,7 @@ def run(
     trail_activation_pct=None,
     trail_giveback_pct=None,
 ):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _select_device()
     print(f"Portfolio swing backtest on {device}")
     sell_label = "any SELL" if sell_confidence_threshold <= 0 else f"sellConf>={sell_confidence_threshold:.2f}"
     spy_label = "off" if spy_fear_block_pct is None else f"<{spy_fear_block_pct:.1f}%"
@@ -756,12 +952,19 @@ if __name__ == "__main__":
     ap.add_argument("--benchmark", default="SPY")
     ap.add_argument("--sweep", action="store_true",
                     help="Grid over slots x confidence (shares inference across configs)")
-    ap.add_argument("--slots-grid", default="10,15,20")
+    ap.add_argument("--sweep-slots", action="store_true",
+                    help="Grid MAX_POSITIONS only (fixed buy/sell); shows concurrent slot utilization")
+    ap.add_argument("--slots-grid", default="10,15,20,25,30,35,40")
     ap.add_argument("--conf-grid", default="0.5,0.6,0.7")
     ap.add_argument("--sweep-sell", action="store_true",
                     help="Grid over sell-confidence at fixed --max-positions and --confidence-threshold")
     ap.add_argument("--sell-conf-grid", default="0.25,0.35,0.40",
                     help="Sell confidence levels (0 = any SELL action, no gate)")
+    ap.add_argument("--sweep-temp", action="store_true",
+                    help="Swing temperature re-sweep: temp x buy-conf at fixed slots/sell "
+                         "(re-infers per temperature) vs validated 0.01/0.70")
+    ap.add_argument("--temp-grid", default="0.01,0.05,0.1,0.25",
+                    help="Confidence temperatures for --sweep-temp")
     ap.add_argument("--sweep-cost", action="store_true",
                     help="Sweep cost-per-side (see --cost-grid)")
     ap.add_argument("--cost-grid", default="0.0005,0.001,0.0015",
@@ -911,6 +1114,40 @@ if __name__ == "__main__":
             **pextra,
         )
         sys.exit(0)
+    if args.sweep_temp:
+        sweep_temp(
+            model_path=args.model_path,
+            test_start_date=args.test_start_date,
+            test_end_date=args.test_end_date,
+            capital=args.capital,
+            cost_per_side=args.cost_per_side,
+            temp_grid=[float(x) for x in args.temp_grid.split(",")],
+            conf_grid=[float(x) for x in args.conf_grid.split(",")],
+            max_positions=args.max_positions,
+            sell_confidence_threshold=args.sell_confidence_threshold,
+            benchmark=args.benchmark,
+            watchlist_path=watchlist,
+            spy_fear_block_pct=spy_pct,
+            **pextra,
+        )
+        sys.exit(0)
+    if args.sweep_slots:
+        sweep_slots(
+            model_path=args.model_path,
+            test_start_date=args.test_start_date,
+            test_end_date=args.test_end_date,
+            capital=args.capital,
+            cost_per_side=args.cost_per_side,
+            slots_grid=[int(x) for x in args.slots_grid.split(",")],
+            confidence_threshold=args.confidence_threshold,
+            sell_confidence_threshold=args.sell_confidence_threshold,
+            benchmark=args.benchmark,
+            watchlist_path=watchlist,
+            spy_fear_block_pct=spy_pct,
+            **pextra,
+        )
+        sys.exit(0)
+
     if args.sweep:
         sweep(
             model_path=args.model_path,
@@ -923,6 +1160,7 @@ if __name__ == "__main__":
             benchmark=args.benchmark,
             watchlist_path=watchlist,
             spy_fear_block_pct=spy_pct,
+            sell_confidence_threshold=args.sell_confidence_threshold,
             **pextra,
         )
         sys.exit(0)

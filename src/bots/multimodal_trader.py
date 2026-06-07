@@ -18,24 +18,18 @@ from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
-    DayTraderCreds, SwingTraderCreds, MoneyScraperCreds, CryptoTraderCreds,
-    DayTraderConfig, SwingTraderConfig, MoneyScraperConfig, CryptoTraderConfig,
+    SwingTraderCreds,
+    PaperSwingTraderCreds,
+    OptionsTraderCreds,
+    SwingTraderConfig,
     OptionsTraderConfig,
-    ALPACA_BASE_URL, OPTIONS_ALPACA_BASE_URL, SWING_MODEL_PATH, SCALPER_MODEL_PATH, SHARED_MODEL_PATH,
-    OPTIONS_MODEL_PATH, OPTIONS_USE_SWING_MODEL,
+    ALPACA_BASE_URL, OPTIONS_ALPACA_BASE_URL, PAPER_SWING_ALPACA_BASE_URL, SWING_MODEL_PATH,
+    OPTIONS_MODEL_PATH, OPTIONS_BEARISH_MODEL_PATH, OPTIONS_USE_SWING_MODEL,
 )
 from src.execution.options_spread import OptionsSpreadBroker
 from src.agents.ensemble_agent import EnsembleAgent
 from src.data.pipeline import MultiModalDataPipeline
 from src.core.feature_sets import get_feature_cols
-from src.core.indicators import add_intraday_features, add_technical_indicators
-from src.strategies.supertrend import SupertrendStrategy  # <--- Added
-from src.strategies.day_trend_follow import (
-    entry_score,
-    signal_at_bar,
-    spy_trend_ok,
-    trend_break_at,
-)
 
 
 class MultiModalTrader:
@@ -43,33 +37,27 @@ class MultiModalTrader:
     Live Trading Bot using the Multi-Modal Agent (Transformer + Vision + Text).
     """
     def __init__(self, watchlist_path: Optional[str] = None, mode: str = "swing", skip_data_update: bool = False):
-        print(f"🤖 Initializing Multi-Modal Trader ({mode.upper()} Mode)...")
+        print(f"🤖 Initializing Multi-Modal Trader ({mode.replace('_', ' ').upper()} Mode)...")
         
         self.mode = mode.lower()
         self.watchlist_path = watchlist_path
         self._skip_data_update = skip_data_update
         
-        # Select Credentials and Config based on mode
-        if self.mode == 'swing':
-            self.creds = SwingTraderCreds
+        if self.mode in ('swing', 'paper_swing'):
             self.config = SwingTraderConfig
-        elif self.mode == 'day':
-            self.creds = DayTraderCreds
-            self.config = DayTraderConfig
-        elif self.mode == 'scraper':
-            self.creds = MoneyScraperCreds
-            self.config = MoneyScraperConfig
-        elif self.mode == 'crypto':
-            self.creds = CryptoTraderCreds
-            self.config = CryptoTraderConfig
+            self.creds = (
+                SwingTraderCreds if self.mode == 'swing' else PaperSwingTraderCreds
+            )
         elif self.mode == 'options':
-            self.creds = DayTraderCreds
+            self.creds = OptionsTraderCreds
             self.config = OptionsTraderConfig
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            raise ValueError(f"Unknown mode: {mode} (use swing, paper_swing, or options)")
 
         api_base_url = str(ALPACA_BASE_URL)
-        if self.mode == 'options':
+        if self.mode == 'paper_swing':
+            api_base_url = str(PAPER_SWING_ALPACA_BASE_URL)
+        elif self.mode == 'options':
             api_base_url = str(OPTIONS_ALPACA_BASE_URL)
             allow_live = os.getenv("OPTIONS_ALLOW_LIVE", "").strip().lower() in (
                 "1", "true", "yes",
@@ -81,6 +69,12 @@ class MultiModalTrader:
                     "(or OPTIONS_ALLOW_LIVE=1 for live)."
                 )
         self._api_base_url = api_base_url
+        if self.mode == 'paper_swing':
+            print(
+                "   Paper swing = live swing mirror (SwingTraderConfig, Gen7, swing_liquid); "
+                "paper keys/host only.",
+                flush=True,
+            )
 
         # 1. API Connection
         self.api = tradeapi.REST(
@@ -94,17 +88,12 @@ class MultiModalTrader:
         self.symbols = self._load_watchlist()
 
         # 6. Swing CSV refresh — defer to pre-open window when market is closed
-        if self.mode in ('swing', 'options'):
+        if self.mode in ('swing', 'paper_swing', 'options'):
             self._maybe_initial_data_update()
 
         self.window_size = 60
-        if self.mode == "day":
-            fs = getattr(self.config, "DAY_FEATURE_SET", "day")
-            self.feature_cols = get_feature_cols(fs)
-            self.num_features = len(self.feature_cols)
-        else:
-            self.feature_cols = get_feature_cols("swing")
-            self.num_features = 11
+        self.feature_cols = get_feature_cols("swing")
+        self.num_features = 11
         self.vision_channels = self.num_features # Same as features for 1D ResNet
         self.action_dim = 3 # Hold, Buy, Sell
         
@@ -117,10 +106,11 @@ class MultiModalTrader:
             action_dim=self.action_dim,
             device=self.device
         )
+        self.bearish_agent: EnsembleAgent | None = None
         
         # Load weights based on mode
         model_path = None
-        if self.mode == 'swing':
+        if self.mode in ('swing', 'paper_swing'):
             model_path = str(SWING_MODEL_PATH)
         elif self.mode == 'options':
             model_path = (
@@ -128,18 +118,9 @@ class MultiModalTrader:
                 if OPTIONS_USE_SWING_MODEL
                 else str(OPTIONS_MODEL_PATH)
             )
-        elif self.mode == 'day':
-            model_path = str(SCALPER_MODEL_PATH)
-        elif self.mode == 'crypto':
-            model_path = str(SHARED_MODEL_PATH)
-            
+
         loaded = False
-        self._day_rules_only = (
-            self.mode == "day" and getattr(self.config, "RULES_ONLY", False)
-        )
-        if self._day_rules_only:
-            print("   Day mode: RULES_ONLY trend follow (RL model not loaded).", flush=True)
-        elif model_path:
+        if model_path:
             prefix = model_path
             if "_balanced.pth" in model_path:
                 prefix = model_path.replace("_balanced.pth", "")
@@ -159,10 +140,8 @@ class MultiModalTrader:
                 # This prevents accidentally loading an older, inferior model (e.g. Ep200 instead of Ep350)
                 path_hint = (
                     "SWING_MODEL_PATH"
-                    if self.mode == "swing"
+                    if self.mode in ("swing", "paper_swing")
                     else "OPTIONS_MODEL_PATH / OPTIONS_USE_SWING_MODEL"
-                    if self.mode == "options"
-                    else "SCALPER_MODEL_PATH"
                 )
                 raise FileNotFoundError(
                     f"\n❌ CRITICAL: The configured model was not found!\n"
@@ -170,8 +149,33 @@ class MultiModalTrader:
                     f"   Action: Aborting startup to prevent loading wrong model.\n"
                     f"   Fix: Check {path_hint} in config/settings.py"
                 )
+
+        if self.mode == "options" and getattr(self.config, "ENABLE_BEARISH_OPENS", False):
+            bear_path = str(OPTIONS_BEARISH_MODEL_PATH)
+            bprefix = bear_path
+            for suffix in ("_balanced.pth", "_aggressive.pth", "_conservative.pth"):
+                if suffix in bear_path:
+                    bprefix = bear_path.replace(suffix, "")
+                    break
+            btarget = f"{bprefix}_balanced.pth"
+            if os.path.exists(btarget):
+                print(f"📂 Loading Bearish Options Model: {bprefix}...", flush=True)
+                self.bearish_agent = EnsembleAgent(
+                    time_series_dim=self.num_features,
+                    vision_channels=self.vision_channels,
+                    action_dim=self.action_dim,
+                    device=self.device,
+                )
+                self.bearish_agent.load(bprefix)
+                self.bearish_agent.set_eval()
+            else:
+                print(
+                    f"   ⚠️ ENABLE_BEARISH_OPENS=True but bearish model missing ({btarget}). "
+                    "Bearish opens disabled.",
+                    flush=True,
+                )
         
-        if not loaded and not self._day_rules_only:
+        if not loaded:
             # Fallback to auto-discovery ONLY if no model path was configured
             print("⚠️ No model path configured in settings. Attempting auto-discovery...")
             import glob
@@ -199,35 +203,20 @@ class MultiModalTrader:
         print("📡 Initializing data pipeline (news cache + tokenizer)...", flush=True)
         feed = getattr(self.config, 'DATA_FEED', 'sip')
         self.pipeline = MultiModalDataPipeline(window_size=self.window_size, creds=self.creds, feed=feed)
-        if self.mode == "day":
-            self.pipeline.day_feature_set = getattr(self.config, "DAY_FEATURE_SET", "day")
-            print(f"   Day feature set: {self.pipeline.day_feature_set} ({self.num_features} features)", flush=True)
         print("📡 Data pipeline ready.", flush=True)
         
         self.last_snapshot_time = None # For rate-limiting daily snapshot refresh in swing mode
 
-        # 6. PDT Removed (Government eliminated pattern day trading rule)
-        pass
-
-        # 7. Supertrend Strategy (Crypto Only)
-        self.supertrend = None
-        if self.mode == 'crypto':
-            # Default Crypto Settings: ATR 10, Multiplier 3.0
-            print("🚀 Initializing Supertrend Strategy (Hybrid Logic)...")
-            self.supertrend = SupertrendStrategy(atr_period=10, multiplier=3.0)
-            
-        # 8. Local State Cache (To avoid API Rate Limits)
+        # 6. Local State Cache (To avoid API Rate Limits)
         self.cached_positions = []
         self.cached_cash = 0.0
         self.cached_buying_power = 0.0
         self.cached_equity = 0.0
         self.last_cache_update = datetime.now()
 
-        # 9. Trailing take-profit state (day + swing).
-        # Maps symbol -> peak unrealized PnL% since entry.
+        # 7. Trailing take-profit state (swing/options).
         self.position_peaks = {}
         self.position_entry_day = {}  # symbol -> date (swing min-hold / trail)
-        self.position_entry_time = {}  # symbol -> datetime (day min/max hold in 15m bars)
         self.options_broker: Optional[OptionsSpreadBroker] = None
         if self.mode == 'options':
             self.options_broker = OptionsSpreadBroker(
@@ -239,10 +228,14 @@ class MultiModalTrader:
                 max_dte=int(getattr(self.config, 'MAX_DTE', 45)),
                 spread_width=float(getattr(self.config, 'SPREAD_WIDTH', 5.0)),
                 limit_slippage_pct=float(getattr(self.config, 'LIMIT_SLIPPAGE_PCT', 0.08)),
+                scale_width_by_price=bool(getattr(self.config, 'SCALE_WIDTH_BY_PRICE', True)),
+                min_open_interest=int(getattr(self.config, 'MIN_OPEN_INTEREST', 10)),
+                max_contracts_per_slot=int(getattr(self.config, 'MAX_CONTRACTS_PER_SLOT', 10)),
+                close_use_market=bool(getattr(self.config, 'CLOSE_USE_MARKET', True)),
             )
             wl = getattr(self.config, "WATCHLIST", "options_liquid_200.txt")
             print(
-                f"   Options: call debit spreads | watchlist={wl} | "
+                f"   Options: multi-strategy spreads | watchlist={wl} | "
                 f"slots={self.config.MAX_POSITIONS} | buy>={self.config.CONFIDENCE_THRESHOLD} | "
                 f"model={os.path.basename(model_path) if model_path else 'none'}",
                 flush=True,
@@ -268,15 +261,27 @@ class MultiModalTrader:
         try:
             clock = self.api.get_clock()
             if clock.is_open:
-                if self.mode in ("swing", "options"):
-                    self._update_historical_data()
-                    if self.mode == "options":
-                        self._update_options_bars()
-                    if getattr(self.config, "PREMARKET_ONLY_FETCH", False) and not self._premarket_cache_valid():
-                        print("⏳ Market open — building scan cache (missed pre-open window)...", flush=True)
-                        self._prefetch_scan_pipeline()
-                else:
-                    self._update_historical_data()
+                if self.mode in ("swing", "paper_swing", "options"):
+                    premarket_only = getattr(self.config, "PREMARKET_ONLY_FETCH", False)
+                    if premarket_only:
+                        # Mid-session restart: use disk CSV + OCC/marks; no bulk re-download.
+                        if not self._premarket_cache_valid():
+                            print(
+                                "⏳ Market open — building scan cache from disk "
+                                "(skipping OCC/CSV re-download)...",
+                                flush=True,
+                            )
+                            self._prefetch_scan_pipeline()
+                    else:
+                        self._update_historical_data()
+                        if self.mode == "options":
+                            self._update_options_bars()
+                        if not self._premarket_cache_valid():
+                            print(
+                                "⏳ Market open — building scan cache (missed pre-open window)...",
+                                flush=True,
+                            )
+                            self._prefetch_scan_pipeline()
                 return
             time_to_open = (clock.next_open - clock.timestamp).total_seconds()
             if time_to_open <= self._preopen_lead_seconds():
@@ -336,11 +341,7 @@ class MultiModalTrader:
             print(f"⚠️ Options bars update failed: {e}. Using cached marks...", flush=True)
 
     def _session_timeframe(self) -> str:
-        if self.mode == "day":
-            return "15Min"
-        if self.mode in ("swing", "options"):
-            return "1D"
-        return "1Min"
+        return "1D"
 
     def _prefetch_live_snapshots(self) -> int:
         """Inject today's daily bars from Alpaca snapshots into the pipeline cache."""
@@ -404,7 +405,7 @@ class MultiModalTrader:
 
     def _prefetch_scan_pipeline(self) -> None:
         """All network I/O for the daily scan: snapshots + per-symbol features."""
-        if self.mode not in ("swing", "options"):
+        if self.mode not in ("swing", "paper_swing", "options"):
             return
         tf = self._session_timeframe()
         print(f"🌅 Pre-market data pipeline ({tf}, {len(self.symbols)} symbols)...", flush=True)
@@ -418,16 +419,11 @@ class MultiModalTrader:
         return self._premarket_scan_day == datetime.now().date()
 
     def _run_premarket_routine(self):
-        """Refresh data and day-trader hygiene before the session opens."""
-        if self.mode in ("swing", "options"):
-            self._update_historical_data()
+        """Refresh CSVs, option marks, and scan cache before the session opens."""
+        self._update_historical_data()
         if self.mode == "options":
             self._update_options_bars()
-        if self.mode in ("swing", "options"):
-            self._prefetch_scan_pipeline()
-        if self.mode == 'day' and getattr(self.config, 'LIQUIDATE_EOD', False):
-            print("☀️ Pre-open: clearing stale day positions...")
-            self.liquidate_all_positions()
+        self._prefetch_scan_pipeline()
 
     def _sleep_until_market_open(self):
         """When closed: sleep until pre-open window, run prep, then sleep until open."""
@@ -512,13 +508,8 @@ class MultiModalTrader:
         
         # If no path provided, try default locations based on mode
         if not path:
-            if self.mode == 'crypto':
-                path = os.path.join("config", "watchlists", "crypto_watchlist.txt")
-            elif self.mode == 'day':
-                path = os.path.join("config", "watchlists", "day_trade_list.txt")
-            else:
-                default_list = getattr(self.config, "WATCHLIST", "swing_liquid.txt")
-                path = os.path.join("config", "watchlists", default_list)
+            default_list = getattr(self.config, "WATCHLIST", "swing_liquid.txt")
+            path = os.path.join("config", "watchlists", default_list)
 
         # Fallback to root if not found
         if not os.path.exists(path):
@@ -637,10 +628,11 @@ class MultiModalTrader:
             pass
         return None
 
-    def _batch_score_symbols(self, data_results):
+    def _batch_score_symbols(self, data_results, *, agent: EnsembleAgent | None = None):
         """GPU batch inference (same batch_act path as portfolio backtest)."""
         if not data_results:
             return []
+        infer_agent = agent or self.agent
         chunk_size = int(getattr(self.config, "INFER_BATCH_SIZE", 128))
         scored = []
         infer_start = time.time()
@@ -652,8 +644,11 @@ class MultiModalTrader:
             mask_batch = torch.stack([r[3] for r in chunk]).to(self.device)
 
             with torch.inference_mode():
-                actions, conf = self.agent.batch_act(
+                actions, conf = infer_agent.batch_act(
                     ts_batch, ids_batch, mask_batch, return_confidence=True,
+                    confidence_temperature=float(
+                        getattr(self.config, "CONFIDENCE_TEMPERATURE", 0.01)
+                    ),
                 )
             actions_np = actions.detach().cpu().numpy()
             conf_np = conf.detach().cpu().numpy()
@@ -673,65 +668,8 @@ class MultiModalTrader:
         )
         return scored
 
-    def _day_trend_bars(self, symbol: str, timeframe: str = "15Min") -> pd.DataFrame | None:
-        """15Min bars with intraday features for trend rules."""
-        df = self.pipeline.market_fetcher.get_bars(
-            symbol, lookback_days=15, timeframe=timeframe,
-        )
-        if df is None or df.empty or len(df) < 30:
-            return None
-        df = add_technical_indicators(df)
-        df = add_intraday_features(df)
-        df = df.replace([np.inf, -np.inf], np.nan).dropna()
-        if len(df) < 30:
-            return None
-        return df
-
-    def _day_trend_break(self, symbol: str, timeframe: str = "15Min") -> bool:
-        if not getattr(self.config, "EXIT_ON_TREND_BREAK", True):
-            return False
-        df = self._day_trend_bars(symbol, timeframe)
-        if df is None:
-            return False
-        variant = getattr(self.config, "TREND_VARIANT", "simple")
-        return trend_break_at(df, len(df) - 1, variant)
-
-    def _score_day_trend_rules(self, timeframe: str = "15Min") -> list[dict]:
-        """Rules-only scan: BUY when last completed bar passes trend entry."""
-        variant = getattr(self.config, "TREND_VARIANT", "simple")
-        scored: list[dict] = []
-
-        def task(symbol: str):
-            try:
-                df = self._day_trend_bars(symbol, timeframe)
-                if df is None:
-                    return None
-                i = len(df) - 2
-                if i < 1:
-                    return None
-                price = float(df["Close"].iloc[-1])
-                if signal_at_bar(df, i, variant):
-                    conf = entry_score(df, i, variant)
-                    return {"symbol": symbol, "action": 1, "confidence": conf, "price": price}
-                return {"symbol": symbol, "action": 0, "confidence": 0.0, "price": price}
-            except Exception:
-                return None
-
-        workers = 5
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(task, sym): sym for sym in self.symbols}
-            for fut in as_completed(futs):
-                res = fut.result()
-                if res:
-                    scored.append(res)
-        buys = sum(1 for x in scored if x["action"] == 1)
-        print(f"   Trend rules: {buys} BUY candidates / {len(scored)} symbols", flush=True)
-        return scored
-
     def _is_fractionable(self, symbol: str) -> bool:
         """Whether Alpaca accepts notional/fractional qty for this symbol."""
-        if self.mode == 'crypto':
-            return True
         if symbol in self._fractionable_cache:
             return self._fractionable_cache[symbol]
         try:
@@ -749,42 +687,14 @@ class MultiModalTrader:
             getattr(self.config, 'MIN_HOLD_DAYS', 2),
         )
 
-    def _day_bars_held(self, symbol: str) -> int:
-        t0 = self.position_entry_time.get(symbol)
-        if t0 is None:
-            return 0
-        return int((datetime.now() - t0).total_seconds() // 900)
-
-    def _day_allow_agent_sell(self, symbol, avg_entry, current_price):
-        """Defer soft SELL on green day trades until MIN_HOLD_BARS (probe-aligned)."""
-        if self.mode != "day":
-            return True
-        if avg_entry <= 0 or current_price <= 0:
-            return True
-        pnl_pct = (current_price - avg_entry) / avg_entry
-        min_hold = int(getattr(self.config, "MIN_HOLD_BARS", 6))
-        max_hold = int(getattr(self.config, "MAX_HOLD_BARS", 12))
-        bars = self._day_bars_held(symbol)
-        if max_hold > 0 and bars >= max_hold:
-            return True
-        if pnl_pct > 0 and min_hold > 0 and bars < min_hold:
-            return False
-        if getattr(self.config, "ENABLE_WINNER_TRAIL", False):
-            peak = max(self.position_peaks.get(symbol, pnl_pct), pnl_pct)
-            self.position_peaks[symbol] = peak
-            act_pct = getattr(self.config, "TRAIL_ACTIVATION_PCT", 0.015)
-            gb = getattr(self.config, "TRAIL_GIVEBACK_PCT", 0.008)
-            if peak >= act_pct:
-                return pnl_pct <= peak - gb
-        return True
-
     def _options_underlyings_held(self) -> set[str]:
         if not self.options_broker:
             return set()
-        return self.options_broker.underlyings_with_open_spreads(self.cached_positions)
+        held = self.options_broker.underlyings_with_open_spreads(self.cached_positions)
+        return held | self.options_broker.underlyings_with_pending_opens()
 
     def _execute_options_trade(self, symbol, action, current_price, confidence=0.0):
-        """Open/close call debit spreads from swing BUY/SELL signals."""
+        """Open/close option spreads from swing BUY/SELL signals."""
         if action == 0:
             print(f"   ⏸️ {symbol}: HOLD")
             return
@@ -815,21 +725,49 @@ class MultiModalTrader:
             if spot <= 0:
                 print(f"   ⚠️ {underlying}: no live price for strike selection.")
                 return
-            broker.open_call_debit_spread(underlying, spot, budget)
+            bullish = getattr(
+                self.config, "BULLISH_STRATEGIES", ("call_debit", "bull_put_credit", "long_call")
+            )
+            long_call_min = float(getattr(self.config, "LONG_CALL_MIN_CONFIDENCE", 0.70))
+            broker.open_bullish_spread(
+                underlying, spot, budget, bullish,
+                confidence=confidence,
+                long_call_min_confidence=long_call_min,
+            )
             self.position_entry_day[underlying] = datetime.now().date()
             return
 
         if action == 2:
-            if not has_spread:
-                return
-            broker.close_call_debit_spread(underlying)
-            self.position_peaks.pop(underlying, None)
-            self.position_entry_day.pop(underlying, None)
-            return True
+            if has_spread:
+                broker.close_spread(underlying)
+                self.position_peaks.pop(underlying, None)
+                self.position_entry_day.pop(underlying, None)
+                return True
+            return
+
+    def _execute_bearish_options_open(self, symbol, current_price, confidence=0.0):
+        """Open bearish spread from the separate bearish model BUY signal."""
+        broker = self.options_broker
+        if broker is None:
+            return
+        underlying = symbol.upper()
+        if underlying in self._options_underlyings_held():
+            return
+        if len(self._options_underlyings_held()) >= int(self.config.MAX_POSITIONS):
+            return
+        budget = self._calc_buy_alloc()
+        if budget < float(getattr(self.config, "MIN_BUYING_POWER", 50.0)):
+            return "NO_BP"
+        spot = self._get_live_price(underlying) or float(current_price or 0)
+        if spot <= 0:
+            return
+        bearish = getattr(self.config, "BEARISH_STRATEGIES", ("put_debit", "bear_call_credit"))
+        broker.open_bearish_spread(underlying, spot, budget, bearish)
+        self.position_entry_day[underlying] = datetime.now().date()
 
     def _swing_allow_agent_sell(self, symbol, avg_entry, current_price):
         """Defer soft agent SELLs on winners until trail or min-hold rules allow."""
-        if self.mode not in ('swing', 'options') or not getattr(self.config, 'ENABLE_WINNER_TRAIL', False):
+        if self.mode not in ('swing', 'paper_swing', 'options') or not getattr(self.config, 'ENABLE_WINNER_TRAIL', False):
             return True
         if avg_entry <= 0 or current_price <= 0:
             return True
@@ -863,15 +801,11 @@ class MultiModalTrader:
             has_position = symbol in positions_dict
             qty_held = float(positions_dict[symbol].qty) if has_position else 0.0
             
-            # Filter positions by asset class (Crypto vs Equity)
-            target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
             my_positions = [
                 p for p in self.cached_positions
-                if getattr(p, 'asset_class', 'us_equity') == target_asset_class
+                if getattr(p, 'asset_class', 'us_equity') == 'us_equity'
             ]
-            
-            # Determine TIF
-            tif = 'gtc' if self.mode == 'crypto' else 'day'
+            tif = 'day'
             
             if action == 1: # BUY
                 if has_position:
@@ -880,7 +814,7 @@ class MultiModalTrader:
                 
                 # 1. Check Max Positions
                 if len(my_positions) >= self.config.MAX_POSITIONS:
-                    print(f"   ⚠️ Max positions reached ({len(my_positions)}/{self.config.MAX_POSITIONS}) for {target_asset_class}. Skipping BUY.")
+                    print(f"   ⚠️ Max positions reached ({len(my_positions)}/{self.config.MAX_POSITIONS}). Skipping BUY.")
                     return
 
                 # 2. Equal-weight sizing: fixed equity/MAX_POSITIONS per slot (portfolio backtest parity).
@@ -901,18 +835,18 @@ class MultiModalTrader:
                     drift = abs(live_px - signal_px) / live_px
                     if drift > 0.10:
                         print(f"   ⚠️ {symbol}: CSV/signal ${signal_px:.2f} vs Alpaca live ${live_px:.2f} "
-                              f"({drift*100:.0f}% off) — using ${notional:.2f} NOTIONAL order (ignores bad CSV price)")
+                              f"({drift*100:.0f}% off) — sizing from live price only")
                 elif not live_px:
-                    print(f"   ⚠️ {symbol}: Could not verify live price; using ${notional:.2f} NOTIONAL order.")
+                    print(f"   ⚠️ {symbol}: No live Alpaca quote yet — will use notional if fractionable.")
 
                 eq = max(float(self.cached_equity), 1.0)
-                disp_px = live_px if live_px else signal_px
-                px_for_qty = live_px or signal_px
                 fractionable = self._is_fractionable(symbol)
 
                 if fractionable:
+                    disp_px = live_px if live_px else signal_px
                     print(f"   🚀 {symbol}: BUY ${notional:.2f} notional "
-                          f"(slot target, ~{100*notional/eq:.1f}% of equity, live=${disp_px:.2f})")
+                          f"(slot target, ~{100*notional/eq:.1f}% of equity, "
+                          f"live=${(disp_px or 0):.2f})")
                     self.api.submit_order(
                         symbol=symbol,
                         notional=notional,
@@ -921,24 +855,33 @@ class MultiModalTrader:
                         time_in_force=tif,
                     )
                     est_cost = notional
-                    est_qty = (notional / px_for_qty) if px_for_qty else 0
+                    px_est = live_px or signal_px
+                    est_qty = (notional / px_est) if px_est else 0
                 else:
-                    if not px_for_qty or px_for_qty <= 0:
-                        print(f"   ⚠️ {symbol}: Not fractionable and no live price — skipping BUY.")
+                    # Whole-share symbols: never size from CSV/signal (QRVO-at-$4.89 bug).
+                    if not live_px or live_px <= 0:
+                        print(f"   ⚠️ {symbol}: Not fractionable — need live Alpaca quote to size "
+                              f"shares; skipping BUY.")
                         return
-                    qty = int(notional // px_for_qty)
+                    if signal_px > 0:
+                        drift = abs(live_px - signal_px) / live_px
+                        if drift > 0.10:
+                            print(f"   ⚠️ {symbol}: CSV/signal ${signal_px:.2f} vs live ${live_px:.2f} "
+                                  f"({drift*100:.0f}% off) — skipping whole-share BUY (stale CSV).")
+                            return
+                    qty = int(notional // live_px)
                     if qty < 1:
                         print(f"   ⚠️ {symbol}: Not fractionable; slot ${notional:.2f} "
-                              f"can't buy 1 share @ ${px_for_qty:.2f}. Skipping.")
+                              f"can't buy 1 share @ live ${live_px:.2f}. Skipping.")
                         return
-                    max_qty = int(spendable // px_for_qty)
+                    max_qty = int(spendable // live_px)
                     qty = min(qty, max_qty)
                     if qty < 1:
-                        print(f"   ⚠️ Insufficient cash for 1 whole share of {symbol} @ ${px_for_qty:.2f}.")
+                        print(f"   ⚠️ Insufficient cash for 1 whole share of {symbol} @ live ${live_px:.2f}.")
                         return 'NO_BP'
-                    est_cost = qty * px_for_qty
+                    est_cost = qty * live_px
                     print(f"   🚀 {symbol}: BUY {qty} shares (~${est_cost:.2f}, "
-                          f"not fractionable, live=${px_for_qty:.2f})")
+                          f"not fractionable, live=${live_px:.2f})")
                     self.api.submit_order(
                         symbol=symbol,
                         qty=qty,
@@ -954,12 +897,9 @@ class MultiModalTrader:
                         self.symbol = s
                         self.qty = q
                         self.asset_class = ac
-                self.cached_positions.append(MockPos(symbol, max(est_qty, 0.0001), target_asset_class))
-                if self.mode == 'swing':
+                self.cached_positions.append(MockPos(symbol, max(est_qty, 0.0001), 'us_equity'))
+                if self.mode in ('swing', 'paper_swing'):
                     self.position_entry_day[symbol] = datetime.now().date()
-                    self.position_peaks[symbol] = 0.0
-                if self.mode == 'day':
-                    self.position_entry_time[symbol] = datetime.now()
                     self.position_peaks[symbol] = 0.0
 
             elif action == 2:  # SELL
@@ -980,7 +920,6 @@ class MultiModalTrader:
                 self.cached_positions = [p for p in self.cached_positions if p.symbol != symbol]
                 self.position_peaks.pop(symbol, None)
                 self.position_entry_day.pop(symbol, None)
-                self.position_entry_time.pop(symbol, None)
                 return True  # Success
                 
         except Exception as e:
@@ -1002,66 +941,30 @@ class MultiModalTrader:
         try:
             if self.mode == 'options' and self.options_broker:
                 for u in sorted(self._options_underlyings_held()):
-                    self.options_broker.close_call_debit_spread(u)
+                    self.options_broker.close_spread(u)
                 self.position_peaks.clear()
                 self.position_entry_day.clear()
                 print("✅ Option spreads close orders submitted.")
                 return
 
             positions = self.api.list_positions()
-            target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
-
             for pos in positions:
-                if pos.asset_class == target_asset_class:
+                if pos.asset_class == 'us_equity':
                     print(f"   📉 Closing {pos.symbol} ({pos.qty})...")
-                    # Crypto doesn't support 'day' TIF, use 'gtc'
-                    tif = 'gtc' if self.mode == 'crypto' else 'day'
                     self.api.submit_order(
                         symbol=pos.symbol,
                         qty=pos.qty,
                         side='sell',
                         type='market',
-                        time_in_force=tif
+                        time_in_force='day',
                     )
-            print(f"✅ All {target_asset_class} positions liquidated.")
+            print("✅ All equity positions liquidated.")
             # Reset trailing take-profit state (we're flat now).
             self.position_peaks = {}
         except Exception as e:
             print(f"❌ Error liquidating positions: {e}")
 
 
-
-    def _calculate_atr_trailing_stop(self, df, atr_period=14, multiplier=3.0):
-        """
-        Calculates Chandelier Exit (Long)
-        Stop = Highest High (last N) - ATR(N) * Multiplier
-        """
-        try:
-            # Handle case sensitivity for columns
-            high = df['High'] if 'High' in df.columns else df['high']
-            low = df['Low'] if 'Low' in df.columns else df['low']
-            close = df['Close'] if 'Close' in df.columns else df['close']
-            
-            # Calculate TR
-            tr1 = high - low
-            tr2 = abs(high - close.shift(1))
-            tr3 = abs(low - close.shift(1))
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            
-            # Calculate ATR
-            atr = tr.rolling(window=atr_period).mean()
-            
-            # Calculate Highest High over the period
-            highest_high = high.rolling(window=atr_period).max()
-            
-            # Calculate Stop
-            stop_price = highest_high - (atr * multiplier)
-
-            atr_value = atr.iloc[-1]
-            return stop_price.iloc[-1], atr_value
-        except Exception as e:
-            print(f"Error calculating trailing stop: {e}. Columns: {df.columns}")
-            return None, None
 
     def _check_market_sentiment(self):
         """
@@ -1091,32 +994,9 @@ class MultiModalTrader:
             print(f"   Sentiment check failed: {e}")
             return 'neutral'
 
-    def _spy_trend_allows_buys(self, timeframe: str = "15Min") -> bool:
-        """SPY above session VWAP with bullish EMA structure (15Min bars)."""
-        if not getattr(self.config, "ENABLE_SPY_TREND_FILTER", False):
-            return True
-        df = self._day_trend_bars("SPY", timeframe)
-        if df is None:
-            print("   SPY trend filter: no 15Min data — blocking new buys", flush=True)
-            return False
-        i = len(df) - 2
-        min_dist = float(getattr(self.config, "SPY_VWAP_MIN_DIST", 0.0))
-        ok = spy_trend_ok(df, i, min_dist)
-        vwap_d = float(df["vwap_dist"].iloc[i]) * 100.0
-        print(
-            f"   SPY trend filter: vwap_dist={vwap_d:+.2f}% -> "
-            f"{'ALLOW' if ok else 'BLOCK'}",
-            flush=True,
-        )
-        return ok
-
     def run_loop(self):
         # Determine Timeframe
-        timeframe = '1Min'
-        if self.mode in ('swing', 'options'):
-            timeframe = '1D'
-        elif self.mode == 'day':
-            timeframe = '15Min'
+        timeframe = '1D'
 
         print(f"\n🚀 Starting Trading Loop in {self.mode.upper()} mode ({timeframe})...")
         if self.mode == "options":
@@ -1126,42 +1006,15 @@ class MultiModalTrader:
                 flush=True,
             )
         
-        # Initial Cleanup for Day Trader (if restarted mid-day or morning)
-        if self.mode == 'day' and self.config.LIQUIDATE_EOD:
-             # Check if we have positions that shouldn't be there?
-             # For now, we rely on the loop logic, but we could force a check here.
-             pass
-
         while True:
-            # Check Market Hours if not Crypto
-            if self.mode != 'crypto':
-                try:
-                    clock = self.api.get_clock()
-                    now = clock.timestamp
-                    next_open = clock.next_open
-                    next_close = clock.next_close
-                    
-                    # 1. Market Closed Logic
-                    if not clock.is_open:
-                        self._sleep_until_market_open()
-                        continue
-                    
-                    # 2. Day Trader End-of-Day Logic
-                    if self.mode == 'day':
-                        time_to_close = (next_close - now).total_seconds()
-                        
-                        # If less than 10 mins to close (600 seconds)
-                        if time_to_close <= 600:
-                            print(f"⏰ Market closing in {time_to_close/60:.1f} mins. Stopping scans.")
-                            self.liquidate_all_positions()
-                            
-                            # Sleep until next pre-open window
-                            self._sleep_until_market_open()
-                            continue
-
-                except Exception as e:
-                    print(f"⚠️ Error checking clock: {e}")
-                    time.sleep(60)
+            try:
+                clock = self.api.get_clock()
+                if not clock.is_open:
+                    self._sleep_until_market_open()
+                    continue
+            except Exception as e:
+                print(f"⚠️ Error checking clock: {e}")
+                time.sleep(60)
             
             # --- Refresh Account State (CACHE) ---
             self.refresh_account_state()
@@ -1171,13 +1024,23 @@ class MultiModalTrader:
             # --- OPTIONS: premium stop + expiry exit ---
             if self.mode == 'options' and self.options_broker and self.cached_positions:
                 prem_stop = float(getattr(self.config, 'PREMIUM_STOP_PCT', 0.40))
+                profit_target = float(getattr(self.config, 'PROFIT_TARGET_PCT', 0.0))
                 min_dte_exit = int(getattr(self.config, 'MIN_DTE_EXIT', 5))
-                for u in list(self._options_underlyings_held()):
+                held_spreads = self.options_broker.underlyings_with_open_spreads(
+                    self.cached_positions
+                )
+                for u in sorted(held_spreads):
                     pnl = self.options_broker.spread_unrealized_pct(self.cached_positions, u)
                     dte = self.options_broker.days_to_expiry(self.cached_positions, u)
+                    print(
+                        f"   📉 {u} spread P/L: {pnl*100:+.1f}%"
+                        + (f" (DTE={dte})" if dte is not None else ""),
+                    )
                     reason = None
                     if pnl <= -prem_stop:
                         reason = f"PREMIUM STOP ({pnl*100:.1f}%)"
+                    elif profit_target > 0 and pnl >= profit_target:
+                        reason = f"PROFIT TARGET (+{pnl*100:.1f}%)"
                     elif dte is not None and dte <= min_dte_exit:
                         reason = f"EXPIRY WINDOW (DTE={dte})"
                     if reason:
@@ -1185,7 +1048,7 @@ class MultiModalTrader:
                         self.execute_trade(u, 2, 0.0, confidence=1.0)
 
             # --- SWING: trailing take-profit on winners (hold longer) ---
-            if self.mode == 'swing' and getattr(self.config, 'ENABLE_WINNER_TRAIL', False) and self.cached_positions:
+            if self.mode in ('swing', 'paper_swing') and getattr(self.config, 'ENABLE_WINNER_TRAIL', False) and self.cached_positions:
                 act_pct, giveback_pct, _ = self._swing_trail_params()
                 for pos in self.cached_positions:
                     if pos.asset_class != 'us_equity':
@@ -1209,64 +1072,11 @@ class MultiModalTrader:
                     except Exception as e:
                         print(f"   ⚠️ Swing trail check failed for {pos.symbol}: {e}")
 
-            # --- DAY HARD EXITS: stop, optional trail, max-hold time stop ---
-            if self.mode == 'day' and self.cached_positions:
-                stop_pct = getattr(self.config, 'STOP_LOSS_PCT', 0.006)
-                max_hold = int(getattr(self.config, 'MAX_HOLD_BARS', 12))
-                hard_cap_pct = getattr(self.config, 'PROFIT_TARGET_PCT', 0.08)
-                use_trail = getattr(self.config, 'ENABLE_WINNER_TRAIL', False)
-                activation_pct = getattr(self.config, 'TRAIL_ACTIVATION_PCT', 0.015)
-                giveback_pct = getattr(self.config, 'TRAIL_GIVEBACK_PCT', 0.008)
-
-                held_now = set()
-                for pos in self.cached_positions:
-                    if pos.asset_class != 'us_equity':
-                        continue
-                    held_now.add(pos.symbol)
-                    try:
-                        avg_entry = float(pos.avg_entry_price)
-                        current_price = float(pos.current_price)
-                        if avg_entry <= 0:
-                            continue
-
-                        pnl_pct = (current_price - avg_entry) / avg_entry
-                        peak = max(self.position_peaks.get(pos.symbol, pnl_pct), pnl_pct)
-                        self.position_peaks[pos.symbol] = peak
-                        bars = self._day_bars_held(pos.symbol)
-
-                        action_reason = None
-                        if pnl_pct <= -stop_pct:
-                            action_reason = f"STOP LOSS ({pnl_pct*100:.2f}%)"
-                        elif self._day_trend_break(pos.symbol, timeframe):
-                            action_reason = f"TREND BREAK ({pnl_pct*100:+.2f}%)"
-                        elif max_hold > 0 and bars >= max_hold:
-                            action_reason = f"TIME STOP ({bars} bars, {pnl_pct*100:+.2f}%)"
-                        elif pnl_pct >= hard_cap_pct:
-                            action_reason = f"PROFIT CAP (+{pnl_pct*100:.2f}%)"
-                        elif use_trail and peak >= activation_pct and pnl_pct <= peak - giveback_pct:
-                            action_reason = (
-                                f"TRAILING TP (peak +{peak*100:.2f}%, now +{pnl_pct*100:.2f}%)"
-                            )
-
-                        if action_reason:
-                            print(f"   🚨 {action_reason} → SELL {pos.symbol}")
-                            sold = self.execute_trade(pos.symbol, 2, current_price, confidence=1.0)
-                            if sold:
-                                self.position_peaks.pop(pos.symbol, None)
-                                self.position_entry_time.pop(pos.symbol, None)
-                    except Exception as e:
-                        print(f"   ⚠️ Hard Exit check failed for {pos.symbol}: {e}")
-
-                # Prune trailing state for positions we no longer hold.
-                for sym in list(self.position_peaks.keys()):
-                    if sym not in held_now:
-                        self.position_peaks.pop(sym, None)
-            
             # --- RANKING LOGIC START ---
             print(f"🔍 Scanning {len(self.symbols)} symbols for RANKING...")
 
             premarket_only = (
-                self.mode in ("swing", "options")
+                self.mode in ("swing", "paper_swing", "options")
                 and getattr(self.config, "PREMARKET_ONLY_FETCH", False)
             )
             use_premarket_cache = premarket_only and self._premarket_cache_valid()
@@ -1286,7 +1096,7 @@ class MultiModalTrader:
                     f"built {self._premarket_scan_day}) — no session download/fetch.",
                     flush=True,
                 )
-            elif self.mode in ("swing", "options"):
+            elif self.mode in ("swing", "paper_swing", "options"):
                 fetch_interval = 900
                 should_fetch = True
                 if self.last_snapshot_time:
@@ -1300,77 +1110,55 @@ class MultiModalTrader:
                     except Exception as e:
                         print(f"   ⚠️ Snapshots fetch failed: {e}. Using cached CSV data only.")
             
-            # --- RULES-ONLY DAY: trend follow (no RL inference) ---
-            if self._day_rules_only:
-                scored_opportunities = self._score_day_trend_rules(timeframe)
-            else:
-                scored_opportunities = None
-
-            # --- PHASE 1: DATA FETCHING (RL modes) ---
             data_results: list = []
-            if not self._day_rules_only:
-                if use_premarket_cache:
-                    data_results = list(self._premarket_scan_cache)
-                    print(
-                        f"   ✅ Scan data from pre-market cache "
-                        f"({len(data_results)} items).",
-                        flush=True,
-                    )
-                else:
-                    fetch_start = time.time()
+            if use_premarket_cache:
+                data_results = list(self._premarket_scan_cache)
+                print(
+                    f"   ✅ Scan data from pre-market cache "
+                    f"({len(data_results)} items).",
+                    flush=True,
+                )
+            else:
+                fetch_start = time.time()
 
-                    def fetch_symbol_task(symbol):
-                        try:
-                            data = self.pipeline.fetch_and_process(symbol, timeframe=timeframe)
-                            if data is None:
-                                return None
-                            ts_state, text_ids, text_mask, current_price = data
-                            ts_state = ts_state.reshape(self.window_size, self.num_features)
-                            return (symbol, ts_state, text_ids, text_mask, current_price)
-                        except Exception:
+                def fetch_symbol_task(symbol):
+                    try:
+                        data = self.pipeline.fetch_and_process(symbol, timeframe=timeframe)
+                        if data is None:
                             return None
+                        ts_state, text_ids, text_mask, current_price = data
+                        ts_state = ts_state.reshape(self.window_size, self.num_features)
+                        return (symbol, ts_state, text_ids, text_mask, current_price)
+                    except Exception:
+                        return None
 
-                    workers = 10 if self.mode in ("swing", "options") else 5
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        future_to_symbol = {
-                            executor.submit(fetch_symbol_task, sym): sym for sym in self.symbols
-                        }
-                        completed_count = 0
-                        total = len(self.symbols)
-                        for future in as_completed(future_to_symbol):
-                            completed_count += 1
-                            if completed_count % 10 == 0:
-                                print(f"   ⏳ Fetched {completed_count}/{total}...", end="\r")
-                            res = future.result()
-                            if res:
-                                data_results.append(res)
-                    fetch_duration = time.time() - fetch_start
-                    print(
-                        f"\n   ✅ Data Fetch Complete in {fetch_duration:.2f}s. "
-                        f"(Found {len(data_results)} valid items)"
-                    )
+                workers = 10
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_symbol = {
+                        executor.submit(fetch_symbol_task, sym): sym for sym in self.symbols
+                    }
+                    completed_count = 0
+                    total = len(self.symbols)
+                    for future in as_completed(future_to_symbol):
+                        completed_count += 1
+                        if completed_count % 10 == 0:
+                            print(f"   ⏳ Fetched {completed_count}/{total}...", end="\r")
+                        res = future.result()
+                        if res:
+                            data_results.append(res)
+                fetch_duration = time.time() - fetch_start
+                print(
+                    f"\n   ✅ Data Fetch Complete in {fetch_duration:.2f}s. "
+                    f"(Found {len(data_results)} valid items)"
+                )
 
-                print("   Running batch inference...", flush=True)
-                scored_opportunities = self._batch_score_symbols(data_results)
+            print("   Running batch inference...", flush=True)
+            scored_opportunities = self._batch_score_symbols(data_results)
 
             if getattr(self.config, "VERBOSE_SCAN", False):
                 for item in scored_opportunities[:50]:
                     act_str = ["HOLD", "BUY", "SELL"][item["action"]]
                     print(f"   {item['symbol']}: {act_str} (Conf: {item['confidence']:.3f})")
-
-            # Crypto supertrend overlay (post-inference)
-            if self.mode == "crypto" and self.supertrend:
-                for item in scored_opportunities:
-                    try:
-                        df_bars = self.pipeline.market_fetcher.get_bars(
-                            item["symbol"], lookback_days=2, timeframe="1Min",
-                        )
-                        if df_bars is not None and len(df_bars) > 20:
-                            df_st = self.supertrend.calculate_supertrend(df_bars.copy())
-                            if item["action"] == 1 and not df_st["trend"].iloc[-1]:
-                                item["action"] = 0
-                    except Exception:
-                        pass
 
             # --- RANKING LOGIC END ---
             
@@ -1401,8 +1189,14 @@ class MultiModalTrader:
                 label = "BUY candidates"
             if passing_buys:
                 print(f"   🔍 Top {label} (conf > {threshold}):")
+                held_preview = (
+                    self._options_underlyings_held()
+                    if self.mode == "options"
+                    else {p.symbol for p in self.cached_positions}
+                )
                 for rb in sorted(passing_buys, key=lambda x: x['confidence'], reverse=True)[:5]:
-                    print(f"      {rb['symbol']}: Conf={rb['confidence']:.3f}")
+                    tag = " [held]" if rb["symbol"] in held_preview else ""
+                    print(f"      {rb['symbol']}: Conf={rb['confidence']:.3f}{tag}")
             elif raw_buys:
                 top_raw = max(raw_buys, key=lambda x: x['confidence'])
                 print(
@@ -1460,10 +1254,9 @@ class MultiModalTrader:
             if self.mode == 'options':
                 current_holdings = len(self._options_underlyings_held())
             else:
-                target_asset_class = 'crypto' if self.mode == 'crypto' else 'us_equity'
                 current_holdings = len([
                     p for p in self.cached_positions
-                    if getattr(p, 'asset_class', 'us_equity') == target_asset_class
+                    if getattr(p, 'asset_class', 'us_equity') == 'us_equity'
                 ])
             slots_left = max(0, self.config.MAX_POSITIONS - current_holdings)
             
@@ -1506,12 +1299,6 @@ class MultiModalTrader:
                         flush=True,
                     )
                     buys = []
-            elif self.mode == "day":
-                self._check_market_sentiment()
-
-            if buys and self.mode == "day" and not self._spy_trend_allows_buys(timeframe):
-                print("   SPY trend filter: blocking new buys (SPY below VWAP trend).", flush=True)
-                buys = []
 
             if buys:
                 if self.mode == "options":
@@ -1536,7 +1323,7 @@ class MultiModalTrader:
 
             if buys:
                 if self.mode == "options":
-                    print(f"\n📊 CALL DEBIT SPREAD CANDIDATES (ranked by confidence):")
+                    print(f"\n📊 BULLISH SPREAD CANDIDATES (ranked by confidence):")
                 else:
                     print(f"\n📊 TOP RANKED BUY OPPORTUNITIES (Execution Optimization Active):")
                 for i, item in enumerate(buys[:10]):
@@ -1548,7 +1335,8 @@ class MultiModalTrader:
                 sym = item['symbol']
                 live_px = float(item['price'])
                 if self.mode == 'options':
-                    if sym not in self._options_underlyings_held():
+                    held_opts = self._options_underlyings_held()
+                    if sym not in held_opts:
                         continue
                     allow_sell = self._swing_allow_agent_sell(sym, live_px * 0.99, live_px)
                 else:
@@ -1557,12 +1345,7 @@ class MultiModalTrader:
                     if not pos:
                         continue
                     avg_entry = float(getattr(pos, 'avg_entry_price', 0) or 0)
-                    if self.mode == "day" and self._day_rules_only:
-                        allow_sell = False
-                    elif self.mode == 'day':
-                        allow_sell = self._day_allow_agent_sell(sym, avg_entry, live_px)
-                    else:
-                        allow_sell = self._swing_allow_agent_sell(sym, avg_entry, live_px)
+                    allow_sell = self._swing_allow_agent_sell(sym, avg_entry, live_px)
                 if not allow_sell:
                     print(f"   🔇 Deferring agent SELL for {item['symbol']} (min hold / trail)")
                     continue
@@ -1596,7 +1379,7 @@ class MultiModalTrader:
                         print("   🛑 Stopping BUYs — insufficient cash on hand (cash-only).")
                     break
                 if self.mode == "options":
-                    print(f"📈 OPEN call debit spread on {item['symbol']} (Conf: {item['confidence']:.2f})")
+                    print(f"📈 OPEN bullish spread on {item['symbol']} (Conf: {item['confidence']:.2f})")
                 else:
                     print(f"📈 Executing BUY for {item['symbol']} (Conf: {item['confidence']:.2f})")
                 result = self.execute_trade(item['symbol'], 1, item['price'], confidence=item['confidence'])
@@ -1607,6 +1390,38 @@ class MultiModalTrader:
                         print("   🛑 Stopping BUYs — insufficient cash on hand (cash-only).")
                     break
 
+            if (
+                self.mode == "options"
+                and self.bearish_agent is not None
+                and getattr(self.config, "ENABLE_BEARISH_OPENS", False)
+            ):
+                bear_thresh = float(getattr(self.config, "BEARISH_CONFIDENCE_THRESHOLD", 0.65))
+                bear_scored = self._batch_score_symbols(data_results, agent=self.bearish_agent)
+                held_opts = self._options_underlyings_held()
+                bear_buys = [
+                    x for x in bear_scored
+                    if x["action"] == 1
+                    and x["confidence"] > bear_thresh
+                    and x["symbol"] not in held_opts
+                ]
+                bear_buys.sort(key=lambda x: x["confidence"], reverse=True)
+                slots_left = max(0, self.config.MAX_POSITIONS - len(held_opts))
+                if bear_buys and slots_left > 0:
+                    print(f"\n📊 BEARISH SPREAD CANDIDATES (bearish model BUY > {bear_thresh}):")
+                    for i, item in enumerate(bear_buys[: min(10, slots_left)]):
+                        print(f"   {i+1}. {item['symbol']} (Conf: {item['confidence']:.3f})")
+                    for item in bear_buys[:slots_left]:
+                        if self._spendable_cash() < min_funds:
+                            print("   🛑 Stopping bearish opens — insufficient buying power.")
+                            break
+                        print(f"📉 OPEN bearish spread on {item['symbol']} (Conf: {item['confidence']:.2f})")
+                        result = self._execute_bearish_options_open(
+                            item['symbol'], item['price'], confidence=item['confidence'],
+                        )
+                        if result == 'NO_BP':
+                            print("   🛑 Stopping bearish opens — insufficient buying power.")
+                            break
+
             if buys:
                 # Sync positions/cash from Alpaca after fills (notional qty unknown until fill).
                 try:
@@ -1616,7 +1431,10 @@ class MultiModalTrader:
                     pass
 
             # Sleep
-            sleep_time = getattr(self.config, 'SCAN_INTERVAL_SECONDS', 300)
+            sleep_secs = getattr(self.config, 'SCAN_INTERVAL_SECONDS', None)
+            if sleep_secs is None:
+                sleep_secs = int(getattr(self.config, 'SCAN_INTERVAL_MINUTES', 5)) * 60
+            sleep_time = int(sleep_secs)
             print(f"💤 Sleeping for {sleep_time} seconds...")
             time.sleep(sleep_time)
 
@@ -1627,8 +1445,8 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         default="swing",
-        choices=["day", "swing", "crypto", "options"],
-        help="Trading mode (options = swing signals + call debit spreads, paper only)",
+        choices=["swing", "paper_swing", "options"],
+        help="Trading mode: swing (live), paper_swing, or options spreads",
     )
     parser.add_argument("--skip-data-update", action="store_true",
                         help="Skip yfinance CSV refresh on startup (use existing local data)")

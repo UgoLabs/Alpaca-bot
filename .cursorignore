@@ -1,6 +1,7 @@
 .venv/
-models/
-data/
+/models/
+/data/
+/data_cache/
 logs/
 *.pth
 *.dll

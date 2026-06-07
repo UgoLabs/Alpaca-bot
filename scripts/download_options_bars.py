@@ -1,7 +1,7 @@
 """
 Download Alpaca historical option leg bars and build spread mark CSVs for training.
 
-Prereqs: swing 1D CSVs in data/historical_swing/, DAY_API_KEY or SWING_API_KEY in .env
+Prereqs: swing 1D CSVs in data/historical_swing/, OPTIONS_API_KEY or SWING_API_KEY in .env
 
 Usage:
   .\\.venv\\Scripts\\python.exe scripts/download_options_bars.py

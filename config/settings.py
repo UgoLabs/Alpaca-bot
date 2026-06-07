@@ -20,20 +20,16 @@ class SwingTraderCreds:
     API_SECRET = os.getenv("SWING_API_SECRET")
 
 
-class MoneyScraperCreds:
-    API_KEY = os.getenv("SCRAPER_API_KEY")
-    API_SECRET = os.getenv("SCRAPER_API_SECRET")
+class OptionsTraderCreds:
+    """Options spread bot (paper by default). Falls back to legacy DAY_* env names."""
+    API_KEY = os.getenv("OPTIONS_API_KEY") or os.getenv("DAY_API_KEY")
+    API_SECRET = os.getenv("OPTIONS_API_SECRET") or os.getenv("DAY_API_SECRET")
 
 
-class DayTraderCreds:
-    API_KEY = os.getenv("DAY_API_KEY")
-    API_SECRET = os.getenv("DAY_API_SECRET")
-
-
-class CryptoTraderCreds:
-    # Prefer crypto-specific vars, but support Alpaca's conventional env names.
-    API_KEY = os.getenv("CRYPTO_API_KEY") or os.getenv("APCA_API_KEY_ID")
-    API_SECRET = os.getenv("CRYPTO_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+class PaperSwingTraderCreds:
+    """Paper mirror of live swing: same bot, PAPER_SWING_* keys + paper API host."""
+    API_KEY = os.getenv("PAPER_SWING_API_KEY")
+    API_SECRET = os.getenv("PAPER_SWING_API_SECRET")
 
 
 # Shared
@@ -41,6 +37,10 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 # Options bot always talks to this host (defaults to paper even if ALPACA_BASE_URL is live).
 OPTIONS_ALPACA_BASE_URL = os.getenv(
     "OPTIONS_ALPACA_BASE_URL",
+    "https://paper-api.alpaca.markets",
+)
+PAPER_SWING_ALPACA_BASE_URL = os.getenv(
+    "PAPER_SWING_ALPACA_BASE_URL",
     "https://paper-api.alpaca.markets",
 )
 
@@ -56,52 +56,37 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))
 # =============================================================================
 
 
-class MoneyScraperConfig:
-    """High-frequency scalper (The 'Crumbs')"""
-    MAX_POSITIONS = 10
-    PROFIT_TARGET_PCT = 0.003   # +0.3% (Quick Scalp)
-    STOP_LOSS_PCT = 0.0015      # -0.15% (Tight Stop)
-    SCAN_INTERVAL_SECONDS = 5
-    USE_WEBSOCKET = True
-    WATCHLIST = "my_portfolio.txt"
-    LIQUIDATE_EOD = True
-    ONLINE_LEARNING = True
-    EXPLORATION_EPSILON = 0.05  # 5% random exploration for trade discovery
-
-
 class SwingTraderConfig:
+    """Daily swing equity bot: Gen7 signals, agent-gated exits (see backtest_swing_portfolio.py).
+
+    Live exits: SELL when model confidence > SELL_CONFIDENCE_THRESHOLD. No hard stop
+    and no winner trail in production (both off OOS on the liquid book).
+    """
+
     WATCHLIST = "swing_liquid.txt"  # ~500 liquid names (build via scripts/build_liquid_watchlist.py)
     MAX_POSITIONS = 40           # Portfolio sweep (2024+ OOS): 40 slots beat 20/30 on return & Sharpe
-    PROFIT_TARGET_PCT = 0.20    # Only used if no Stop ATR
-    STOP_LOSS_PCT = 0.10        # Only used if no Stop ATR
-    SCAN_INTERVAL_MINUTES = 60
-    CONFIDENCE_THRESHOLD = 0.70 # Portfolio sweep: 0.70 + slot ranking -> +68.9% vs SPY +18.8%
-                                # (alpha +50%), Sharpe 1.66, max DD -13.3% at 40 slots.
-    SELL_CONFIDENCE_THRESHOLD = 0.35 # Portfolio sell sweep (40 slots, buy 0.70): best Sharpe 2.12,
-                                     # +97.7% vs SPY +56.8%, max DD -13.1%, win 80%
+    # Buy re-sweep (2024-01-01+, 500-name swing_liquid, temp 0.01, sell 0.35, refreshed CSVs):
+    # 0.50 -> +103.3% vs SPY +56.6% (alpha +46.6%), Sharpe 2.74, max DD -14.0%.
+    # 0.70 (prior live) -> +53.1%, alpha -3.5%. Loosening buy captures more edge on current data.
+    CONFIDENCE_THRESHOLD = 0.50
+    SELL_CONFIDENCE_THRESHOLD = 0.35  # Sell sweep (40 slots): best Sharpe at 0.35; unchanged in buy re-sweep
 
-    # Hold winners longer (daily bars): defer agent SELL until trail or min hold
+    # Winner trail (off in prod; set True to defer soft SELLs on winners)
     ENABLE_WINNER_TRAIL = False  # Liquid OOS: trail off beat tuned trail on (+55% vs ~+38%, Sharpe 2.15)
-    MIN_HOLD_DAYS = 2              # Ignore soft agent SELL for first N sessions (hard stop still applies)
-    TRAIL_ACTIVATION_PCT = 0.05    # Start trailing once position is up +5%
-    TRAIL_GIVEBACK_PCT = 0.03      # Exit when price gives back 3% from peak unrealized gain
-    
-    # Enable Trailing Stops (Defaults)
-    USE_TRAILING_STOP = True
-    STOP_ATR_MULT = 2.0 # Margin Safe (Tight Stops)
-    PROFIT_ATR_MULT = 5.0
-    TRAILING_ATR_MULT = 100.0 # Disable strict trailing stop (still rely on Agent + Hard Stop)
-    PROFIT_ATR_MULT = 5.0     # Profit Target (5x ATR)
+    MIN_HOLD_DAYS = 2            # When trail on: ignore soft agent SELL for first N sessions on winners
+    TRAIL_ACTIVATION_PCT = 0.05  # When trail on: start trailing once position is up +5%
+    TRAIL_GIVEBACK_PCT = 0.03    # When trail on: exit when price gives back 3% from peak gain
+
+    SCAN_INTERVAL_MINUTES = 60
+    SCAN_INTERVAL_SECONDS = 3600   # 60 min between scans (1D bars; was falling back to 300s)
     LIQUIDATE_EOD = False
-    ONLINE_LEARNING = True
-    EXPLORATION_EPSILON = 0.03  # 3% exploration for swing trades
     DATA_FEED = 'iex'  # Free real-time data (fractional market volume)
     DATA_MAX_AGE_HOURS = 20       # Only re-download CSVs older than this on startup
     WAKE_BEFORE_OPEN_MINUTES = 30 # Wake this many minutes before open to finish CSV refresh
     PREMARKET_DOWNLOAD_WORKERS = 4  # Parallel yfinance workers during pre-open refresh
     INFER_BATCH_SIZE = 128          # GPU batch size for live scoring (matches backtest batch_act)
-    ENABLE_SPY_FEAR_FILTER = True   # Block new buys when broad market is down (see SPY_FEAR_BLOCK_PCT)
-    SPY_FEAR_BLOCK_PCT = -1.0       # vs prior close; set ENABLE_SPY_FEAR_FILTER=False to disable
+    ENABLE_SPY_FEAR_FILTER = False  # TEMP: off so session can open buys on red SPY days
+    SPY_FEAR_BLOCK_PCT = -1.0       # vs prior close; re-enable ENABLE_SPY_FEAR_FILTER when done testing
     VERBOSE_SCAN = False            # If True, log every symbol action (slow with large watchlists)
     CASH_ONLY = True              # Never use margin: size orders from cash on hand only
     POSITION_SIZE_PCT = 1.0       # Fraction of equal-weight slot to deploy (1.0 = full slot)
@@ -109,27 +94,36 @@ class SwingTraderConfig:
 
 
 class OptionsTraderConfig:
-    """Swing-signal options bot: call debit spreads, paper only, full liquid universe.
+    """Swing-signal options bot: multi-strategy spreads (paper only), full liquid universe.
 
-    Credentials: DAY_API_KEY / DAY_API_SECRET (same account as day trader).
+    Credentials: OPTIONS_API_KEY / OPTIONS_API_SECRET (legacy: DAY_API_*).
     """
 
     WATCHLIST = "options_liquid_200.txt"  # Live scan (top 200 $ vol; matches training)
     TRAIN_WATCHLIST = "options_liquid_200.txt"  # Options fine-tune / marks download
-    MAX_POSITIONS = 40               # 200-symbol backtest: 40 slots @ conf 0.80 (+26.4% OOS)
-    CONFIDENCE_THRESHOLD = 0.80      # Stricter entries on 200-name book (0.70 was for 20-name list)
+    MAX_POSITIONS = 40               # Sweep winner ep30 @ 0.80 (+69.1%); live conf lowered for activity
+    # Unified eps06 OOS (200-symbol, Feb 2024+): buy 0.65 / sell 0.35 -> +48.1%, Sharpe 0.67, 683 opens.
+    # Short 20-symbol best was 0.65/0.50 (+40.4%, Sharpe 1.19). Full universe needs lower sell thresh.
+    CONFIDENCE_THRESHOLD = 0.65
     SELL_CONFIDENCE_THRESHOLD = 0.35
+    # Softmax temperature for the confidence value ONLY (action selection is unchanged).
+    # Q-gap measurement (scripts/measure_q_gap.py, ep30 BUY picks): median top1-top2 Q gap
+    # ~0.0066, so at temp=0.01 BUY confidence already spans ~0.37-0.85 (p25-p90 0.50-0.75),
+    # 0% saturation. With only 3 actions, RAISING temp collapses confidence toward the 0.333
+    # uniform floor (>=0.05 makes any threshold >~0.45 reject all buys). So 0.01 is correct;
+    # the real lever is CONFIDENCE_THRESHOLD. Swing omits this attr and keeps 0.01 too.
+    CONFIDENCE_TEMPERATURE = 0.01
     MIN_HOLD_DAYS = 2
     ENABLE_WINNER_TRAIL = False
     TRAIL_ACTIVATION_PCT = 0.05
     TRAIL_GIVEBACK_PCT = 0.03
-    ENABLE_SPY_FEAR_FILTER = True
+    ENABLE_SPY_FEAR_FILTER = True  # OOS grid: +46.2% vs +41.8% baseline, DD -31.9% vs -34.6%
     SPY_FEAR_BLOCK_PCT = -1.0
     CASH_ONLY = False                # Options only: size from buying power (margin allowed)
     POSITION_SIZE_PCT = 1.0
     CASH_BUFFER_PCT = 0.02           # Buffer applied to equity-based slot size
     MIN_BUYING_POWER = 50.0          # Skip new spreads if BP below this
-    SCAN_INTERVAL_SECONDS = 300      # Same default as swing live loop (5 min)
+    SCAN_INTERVAL_SECONDS = 3600      # Same default as swing live loop (5 min)
     DATA_FEED = "iex"
     DATA_MAX_AGE_HOURS = 20
     WAKE_BEFORE_OPEN_MINUTES = 90       # 200 symbols: CSV + option marks + snapshots + features
@@ -146,64 +140,24 @@ class OptionsTraderConfig:
     TARGET_DTE = 30
     MIN_DTE = 14
     MAX_DTE = 45
-    SPREAD_WIDTH = 5.0               # Strike width ($) for call debit spread
+    SPREAD_WIDTH = 5.0               # Base strike width ($); scaled by price (see SCALE_WIDTH_BY_PRICE)
+    SCALE_WIDTH_BY_PRICE = True      # <$100 -> 2.5, $100-250 -> base, >$250 -> 2x base (backtest parity)
     LIMIT_SLIPPAGE_PCT = 0.08        # Pay up to 8% above estimated debit for fills
     PREMIUM_STOP_PCT = 0.40          # Close spread if aggregate option P/L <= -40%
+    PROFIT_TARGET_PCT = 0.50         # Take profit: close spread once option P/L >= +50% of premium
     MIN_DTE_EXIT = 5                 # Close before expiry week
+    CLOSE_USE_MARKET = True          # Close spreads with a market MLEG order (reliable fills > limit 0.01)
+    MIN_OPEN_INTEREST = 10           # Skip contracts with open interest below this (liquidity)
+    MAX_CONTRACTS_PER_SLOT = 10      # Cap contracts per spread so one name can't hog the slot
+    # --- Multi-strategy (live paper) ---
+    # Bullish model BUY: try in order until one fits the slot budget
+    BULLISH_STRATEGIES = ("call_debit", "bull_put_credit", "long_call")
+    LONG_CALL_MIN_CONFIDENCE = 0.70  # long_call only when BUY conf >= this
+    # Bearish opens use a SEPARATE model (BUY = open bearish); main model SELL only closes.
+    ENABLE_BEARISH_OPENS = False  # enable after training options_bearish_from_swing
+    BEARISH_STRATEGIES = ("put_debit", "bear_call_credit")
+    BEARISH_CONFIDENCE_THRESHOLD = 0.65
 
-
-class DayTraderConfig:
-    """Intraday trader on 15-minute bars (real-time IEX base data).
-
-    Default: strict rules-only simple trend follow (no RL). Probe-aligned holds:
-    cut losers fast, ~1.5–3h horizon, EOD flat.
-    """
-    RULES_ONLY = False               # Set True for rules-only trend; False for RL (day_from_swing)
-    DAY_FEATURE_SET = "swing"        # 'swing' (11, transfer) | 'day' (15 intraday features)
-    TREND_VARIANT = "simple"         # simple | ema_cross | ma_stack | vwap
-    EXIT_ON_TREND_BREAK = True       # Flat when price loses trend structure
-
-    MAX_POSITIONS = 10
-    CONFIDENCE_THRESHOLD = 0.65      # ep23 OOS sweep best (+0.14% watchlist vs +0.10% raw)
-    SELL_CONFIDENCE_THRESHOLD = 0.30 # Unused in rules-only exits
-
-    # --- SPY regime (block new longs when broad market is weak) ---
-    ENABLE_SPY_TREND_FILTER = True   # Require SPY above session VWAP + bullish EMAs
-    SPY_VWAP_MIN_DIST = 0.0          # Min session VWAP distance (0 = at or above VWAP)
-    ENABLE_SPY_FEAR_FILTER = True    # Also block when SPY day change < SPY_FEAR_BLOCK_PCT
-    SPY_FEAR_BLOCK_PCT = -0.5        # vs prior close (%); tighter than swing -1.0
-
-    # --- Risk + hold horizon (15Min bars) ---
-    STOP_LOSS_PCT = 0.006        # -0.6% hard stop
-    MIN_HOLD_BARS = 8            # ~2h before soft exits on winners
-    MAX_HOLD_BARS = 20           # ~5h time stop (longer trend follow)
-    ENABLE_WINNER_TRAIL = False  # Prefer min/max hold over tight trail
-    TRAIL_ACTIVATION_PCT = 0.015 # Only if ENABLE_WINNER_TRAIL=True
-    TRAIL_GIVEBACK_PCT = 0.008
-    PROFIT_TARGET_PCT = 0.08     # Absolute ceiling for parabolic spikes (+8%)
-    COST_PER_SIDE = 0.0005       # 5 bps/side for backtest planning
-
-    SCAN_INTERVAL_SECONDS = 300  # Re-check positions/signals every 5 min (bars are 15Min)
-    USE_WEBSOCKET = False
-    WATCHLIST = "day_trade_list.txt"
-    LIQUIDATE_EOD = True
-    ONLINE_LEARNING = False      # No RL updates when RULES_ONLY=True
-    EXPLORATION_EPSILON = 0.0
-    DATA_FEED = 'iex'  # Real-time IEX (free tier). Liquid names only.
-
-
-
-class CryptoTraderConfig:
-    """24/7 crypto trader settings."""
-    MAX_POSITIONS = int(os.getenv("CRYPTO_MAX_POSITIONS", "5"))
-    CONFIDENCE_THRESHOLD = 0.60
-    SCAN_INTERVAL_SECONDS = int(os.getenv("CRYPTO_SCAN_INTERVAL_SECONDS", "30"))
-    WATCHLIST = os.getenv("CRYPTO_WATCHLIST", "crypto_watchlist.txt")
-    DATA_FEED = 'sip'  # Default, though crypto uses get_crypto_bars
-    # Crypto tends to be noisier; default to a bit more exploration.
-    EXPLORATION_EPSILON = float(os.getenv("CRYPTO_EXPLORATION_EPSILON", "0.08"))
-    # If set, will attempt to close positions when stopping.
-    LIQUIDATE_ON_EXIT = os.getenv("CRYPTO_LIQUIDATE_ON_EXIT", "0") in ("1", "true", "TRUE", "yes", "YES")
 
 # =============================================================================
 # MODEL PATHS
@@ -214,12 +168,10 @@ MODEL_DIR = Path(__file__).parent.parent / "models"
 
 # Specialized Model Paths (Option A Architecture)
 SWING_MODEL_PATH = MODEL_DIR / "swing_gen7_refined_ep380_balanced.pth"  # Gen 7 EP380 (Stop 3.0/Profit 5.0 Winner)
-OPTIONS_MODEL_PATH = MODEL_DIR / "options_from_swing_200_ep50_balanced.pth"  # 200-name OOS: 40 slots @ 0.80
-SCALPER_MODEL_PATH = MODEL_DIR / "day_from_swing_ep23_balanced.pth"  # pinned ep23 (+0.10% OOS watchlist)
-DAY_FROM_SWING_MODEL_PREFIX = "models/day_from_swing"  # train_day_phase2 --init-from-swing output
+OPTIONS_MODEL_PATH = MODEL_DIR / "options_unified_gen380_eps06_best_balanced.pth"  # unified 5-strat; OOS +48.1% @ 0.65/0.35 (200 sym)
+OPTIONS_BEARISH_MODEL_PATH = MODEL_DIR / "options_bearish_from_swing_best_balanced.pth"  # separate bearish head
 # If True, options mode loads SWING_MODEL_PATH instead of OPTIONS_MODEL_PATH
 OPTIONS_USE_SWING_MODEL = False
-SHARED_MODEL_PATH = MODEL_DIR / "swing_best_balanced.pth"  # Using Gen 5 for Crypto
 REPLAY_BUFFER_PATH = MODEL_DIR / "replay_buffer.pkl"
 
 # =============================================================================
@@ -259,20 +211,10 @@ class TrainingConfig:
     HOLDING_LOSS_PENALTY = float(os.getenv("HOLDING_LOSS_PENALTY", "0.0001"))  # Penalty per step holding a loser
     LOSS_THRESHOLD_PCT = float(os.getenv("LOSS_THRESHOLD_PCT", "0.02"))  # -2% triggers holding penalty
 
-    # Action-shaping knobs (defaults preserve the original swing/crypto behavior).
-    # Intraday (15Min) training overrides these in scripts/train_day_phase2.py:
-    #   - FLAT_DOWNTREND_BONUS must be ~0 intraday or the agent learns to never buy
-    #     (it gets paid every step it sits in cash during dips).
-    #   - INVALID_ACTION_PENALTY too small lets the agent spam SELL as a free no-op.
     FLAT_DOWNTREND_BONUS = float(os.getenv("FLAT_DOWNTREND_BONUS", "0.01"))
     INVALID_ACTION_PENALTY = float(os.getenv("INVALID_ACTION_PENALTY", "0.000001"))
-
-    # Entry-quality reward (forward-return shaping). 0 = disabled (default).
-    # Intraday training enables this so the agent learns profitable entries
-    # instead of collapsing to a never-buy policy.
     ENTRY_REWARD_COEF = float(os.getenv("ENTRY_REWARD_COEF", "0.0"))
     ENTRY_LOOKAHEAD_BARS = int(os.getenv("ENTRY_LOOKAHEAD_BARS", "6"))
-    # Intraday fine-tune: force exit after N bars (0 = disabled). 20 bars @ 15Min ~ 5h.
     MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "0"))
     
     # === REGIME-AWARE REWARD SHAPING ===

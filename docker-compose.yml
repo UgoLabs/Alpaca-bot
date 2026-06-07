@@ -1,11 +1,11 @@
 version: '3.8'
 
 services:
-  # 1. Swing Trader (Holds positions overnight)
+  # 1. Swing Trader (live account)
   swing_bot:
     build: .
     container_name: alpaca_swing_bot
-    command: python -m src.bots.multimodal_trader --mode swing --watchlist config/watchlists/my_portfolio.txt
+    command: python -m src.bots.multimodal_trader --mode swing --watchlist config/watchlists/swing_liquid.txt
     volumes:
       - ./models:/app/models
       - ./logs:/app/logs
@@ -19,11 +19,11 @@ services:
       - BOT_NAME=swing_bot
     restart: unless-stopped
 
-  # 3. Crypto Trader (24/7)
-  crypto_bot:
+  # 2. Options (swing signals → call debit spreads, paper only)
+  options_bot:
     build: .
-    container_name: alpaca_crypto_bot
-    command: python -m src.bots.multimodal_trader --mode crypto --watchlist config/watchlists/crypto_watchlist.txt
+    container_name: alpaca_options_bot
+    command: python -m src.bots.multimodal_trader --mode options --watchlist config/watchlists/options_liquid_200.txt
     volumes:
       - ./models:/app/models
       - ./logs:/app/logs
@@ -34,5 +34,25 @@ services:
       - .env
     environment:
       - PYTHONPATH=/app
-      - BOT_NAME=crypto_bot
+      - BOT_NAME=options_bot
+      - ALPACA_BASE_URL=https://paper-api.alpaca.markets
+    restart: unless-stopped
+
+  # 3. Paper swing (same bot as swing_bot — SwingTraderConfig + Gen7 — paper keys/host only)
+  paper_swing_bot:
+    build: .
+    container_name: alpaca_paper_swing_bot
+    command: python -m src.bots.multimodal_trader --mode paper_swing --watchlist config/watchlists/swing_liquid.txt
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - BOT_NAME=paper_swing_bot
+      - PAPER_SWING_ALPACA_BASE_URL=https://paper-api.alpaca.markets
     restart: unless-stopped

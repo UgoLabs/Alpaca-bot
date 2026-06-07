@@ -229,8 +229,26 @@ class OptionSpreadBarCache:
         self.ensure_symbols([long_sym, short_sym], start, end)
 
     def spread_mark(self, long_sym: str, short_sym: str, on: date) -> Optional[float]:
-        """Per-contract $ mark from Alpaca leg closes, or None if either leg missing."""
-        long_sym, short_sym = long_sym.upper(), short_sym.upper()
+        """Debit spread mark: (long − short) × 100 per contract."""
+        return self.position_mark(long_sym, short_sym, on, is_credit=False)
+
+    def position_mark(
+        self,
+        long_sym: str,
+        short_sym: str,
+        on: date,
+        *,
+        is_credit: bool = False,
+        single_leg: bool = False,
+    ) -> Optional[float]:
+        """Per-contract $ mark; credit spreads use (short − long) × 100."""
+        long_sym = long_sym.upper()
+        if single_leg or not short_sym:
+            lc = self._closes.get(long_sym, {}).get(on)
+            if lc is None:
+                return None
+            return max(0.0, lc * 100.0)
+        short_sym = short_sym.upper()
         key = (long_sym, short_sym, on)
         if key in self._no_spread_on:
             return None
@@ -238,6 +256,8 @@ class OptionSpreadBarCache:
         sc = self._closes.get(short_sym, {}).get(on)
         if lc is None or sc is None:
             return None
+        if is_credit:
+            return max(0.0, (sc - lc) * 100.0)
         return max(0.0, (lc - sc) * 100.0)
 
     def remember_no_spread(self, long_sym: str, short_sym: str, on: date) -> None:
@@ -270,7 +290,24 @@ class DiskOptionSpreadBarCache:
         self.ensure_symbols([long_sym, short_sym], start, end)
 
     def spread_mark(self, long_sym: str, short_sym: str, on: date) -> Optional[float]:
-        long_sym, short_sym = long_sym.upper(), short_sym.upper()
+        return self.position_mark(long_sym, short_sym, on, is_credit=False)
+
+    def position_mark(
+        self,
+        long_sym: str,
+        short_sym: str,
+        on: date,
+        *,
+        is_credit: bool = False,
+        single_leg: bool = False,
+    ) -> Optional[float]:
+        long_sym = long_sym.upper()
+        if single_leg or not short_sym:
+            lc = self._leg_closes(long_sym).get(on)
+            if lc is None:
+                return None
+            return max(0.0, lc * 100.0)
+        short_sym = short_sym.upper()
         key = (long_sym, short_sym, on)
         if key in self._no_spread_on:
             return None
@@ -278,6 +315,8 @@ class DiskOptionSpreadBarCache:
         sc = self._leg_closes(short_sym).get(on)
         if lc is None or sc is None:
             return None
+        if is_credit:
+            return max(0.0, (sc - lc) * 100.0)
         return max(0.0, (lc - sc) * 100.0)
 
     def remember_no_spread(self, long_sym: str, short_sym: str, on: date) -> None:

@@ -106,7 +106,7 @@ class MultiModalRLAgent:
 
     def freeze_feature_extractors(self):
         """Freeze Time-Series and Vision backbones, only train Fusion/Heads."""
-        print("❄️ Freezing Feature Extractors (TS + Vision + Text)...")
+        print("Freezing feature extractors (TS + Vision + Text)...")
         # Freeze TS Head (Transformer/Encoder)
         for param in self.policy_net.ts_head.parameters():
             param.requires_grad = False
@@ -131,6 +131,12 @@ class MultiModalRLAgent:
             
         # Re-init optimizer for all parameters (usually with lower LR)
         self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=self.learning_rate * 0.1, weight_decay=1e-4)
+
+    def clear_memory(self):
+        if self.use_per:
+            cast(PrioritizedReplayBuffer, self.memory).clear()
+        else:
+            cast(deque, self.memory).clear()
 
     def train_step(self):
         # Check if enough samples

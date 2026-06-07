@@ -21,4 +21,4 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 # Default command (overridden by docker-compose)
-CMD ["python", "-m", "src.bots.swing_trader"]
+CMD ["python", "-m", "src.bots.multimodal_trader", "--mode", "swing"]

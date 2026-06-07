@@ -1,15 +1,15 @@
 """
-Fine-tune swing model on bullish multi-strategy spread rewards (Alpaca marks).
+Fine-tune a separate bearish options model (put debit / bear call credit).
 
-BUY opens first tradable: call_debit -> bull_put_credit -> long_call (matches live).
+BUY = open bearish structure (first tradable in priority order).
+SELL = close — same 3-action head, different reward env than the bullish model.
 
-1) Run: python scripts/download_options_bars.py
-2) Run: python scripts/rebuild_multi_strategy_marks.py  (if marks lack bpc/lc columns)
-3) Then: python scripts/train_options_from_swing.py
+Prereq: scripts/rebuild_multi_strategy_marks.py (bearish mark columns)
 
 Usage:
-  .\\.venv\\Scripts\\python.exe scripts/train_options_from_swing.py
-  .\\.venv\\Scripts\\python.exe scripts/train_options_from_swing.py --episodes 60 --freeze-ratio 0.3
+  .\\.venv\\Scripts\\python.exe scripts/train_options_bearish_from_swing.py
+  .\\.venv\\Scripts\\python.exe scripts/train_options_bearish_from_swing.py \\
+      --init-from models/options_from_swing_200_ep30 --episodes 50
 """
 from __future__ import annotations
 
@@ -25,12 +25,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.settings import (  # noqa: E402
-    OPTIONS_MODEL_PATH,
-    OptionsTraderConfig,
-    SWING_MODEL_PATH,
-    TrainingConfig,
-)
+from config.settings import OPTIONS_MODEL_PATH, OptionsTraderConfig, TrainingConfig  # noqa: E402
 
 TrainingConfig.WINDOW_SIZE = 60
 TrainingConfig.MAX_HOLD_BARS = 20
@@ -52,7 +47,7 @@ from src.environments.vector_env_spread import VectorizedMultiStrategySpreadEnv 
 DEFAULT_WATCHLIST = os.path.join(
     "config", "watchlists", getattr(OptionsTraderConfig, "TRAIN_WATCHLIST", "options_liquid_200.txt")
 )
-MODEL_PREFIX = "options_from_swing"
+MODEL_PREFIX = "options_bearish_from_swing"
 
 
 def _normalize_prefix(path: str) -> str:
@@ -63,12 +58,8 @@ def _normalize_prefix(path: str) -> str:
     return path.replace(".pth", "") if path.endswith(".pth") else path
 
 
-def _options_checkpoint_prefix() -> str:
+def _default_init_prefix() -> str:
     return _normalize_prefix(str(OPTIONS_MODEL_PATH))
-
-
-def _swing_checkpoint_prefix() -> str:
-    return _normalize_prefix(str(SWING_MODEL_PATH))
 
 
 def _find_latest_checkpoint(prefix: str) -> tuple[str | None, int]:
@@ -102,8 +93,7 @@ def train(
     max_steps: int | None = None,
     train_every: int = 32,
     store_every: int = 32,
-    log_dir: str = "logs/runs/options_from_swing",
-    init_from_swing: bool = True,
+    log_dir: str = "logs/runs/options_bearish_from_swing",
     init_from: str | None = None,
     freeze_ratio: float = 0.3,
     initial_epsilon: float = 0.15,
@@ -114,25 +104,22 @@ def train(
     checkpoint_every: int = 5,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training options-from-swing on {device.upper()}")
+    print(f"Training bearish options model on {device.upper()}")
 
     loaded = load_options_multi_training_tensors(
-        watchlist_path, mode="bullish", min_date=OPTIONS_DATA_MIN_DATE,
+        watchlist_path, mode="bearish", min_date=OPTIONS_DATA_MIN_DATE,
     )
     if loaded is None:
-        print(f"No training tensors. Run download_options_bars.py first (marks in {MARKS_DIR}).")
+        print(f"No bearish tensors. Run rebuild_multi_strategy_marks.py first ({MARKS_DIR}).")
         return
 
     data, prices, spread_marks, entry_premium, tradable, is_credit, tickers = loaded
     print(f"Symbols: {len(tickers)} — {', '.join(tickers[:8])}{'…' if len(tickers) > 8 else ''}")
-    print(f"Tensor shape: {tuple(data.shape)} (envs, time, features)")
-    print(f"Strategies: call_debit, bull_put_credit, long_call — shape {tuple(spread_marks.shape)}")
-    ckpt = max(1, int(checkpoint_every))
-    print(f"Checkpoints: every {ckpt} ep + best + last -> models/{model_prefix}_*")
+    print(f"Strategies: put_debit, bear_call_credit — shape {tuple(spread_marks.shape)}")
 
     env = VectorizedMultiStrategySpreadEnv(
         data, spread_marks, entry_premium, tradable, is_credit, device=device,
-        strategy_order=(0, 1, 2),
+        strategy_order=(0, 1),
     )
     num_features = data.shape[2]
     agent = EnsembleAgent(
@@ -149,16 +136,7 @@ def train(
     elif resume_latest:
         resolved_prefix, start_ep = _find_latest_checkpoint(model_prefix)
     if not resolved_prefix:
-        opt_prefix = _options_checkpoint_prefix()
-        opt_bal = f"{opt_prefix}_balanced.pth"
-        if os.path.isfile(opt_bal):
-            resolved_prefix = opt_prefix
-        elif init_from_swing:
-            resolved_prefix = _swing_checkpoint_prefix()
-
-    if not resolved_prefix:
-        print("No checkpoint to load.")
-        return
+        resolved_prefix = _default_init_prefix()
 
     try:
         agent.load(resolved_prefix)
@@ -171,9 +149,9 @@ def train(
         model_prefix,
         {
             "init_from": resolved_prefix,
+            "mode": "bearish",
             "watchlist": watchlist_path,
             "tickers": tickers,
-            "num_features": num_features,
         },
     )
 
@@ -195,58 +173,35 @@ def train(
     if use_eps_schedule:
         eps_hi = float(initial_epsilon)
         eps_lo = float(final_epsilon)
-        print(f"Epsilon schedule: {eps_hi:.3f} -> {eps_lo:.3f} linear over {episodes} episodes")
+        for sa in agent.agents:
+            sa.epsilon = eps_hi
     else:
         for sa in agent.agents:
             sa.epsilon = float(initial_epsilon)
-            sa.epsilon_decay = float(epsilon_decay)
 
-    writer = SummaryWriter(log_dir=log_dir)
-    seq_len = 64
-    dummy_ids = torch.zeros((env.num_envs, seq_len), dtype=torch.long, device=device)
-    dummy_mask = torch.ones((env.num_envs, seq_len), dtype=torch.long, device=device)
-    dummy_ids_np = dummy_ids[0].detach().cpu().numpy()
-    dummy_mask_np = dummy_mask[0].detach().cpu().numpy()
-
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir)
     best_reward = float("-inf")
-    meta_path = os.path.join("models", f"{model_prefix}_best.meta.json")
-    if os.path.isfile(meta_path):
-        try:
-            with open(meta_path, encoding="utf-8") as f:
-                best_reward = float(json.load(f).get("best_reward", best_reward))
-        except Exception:
-            pass
-
     last_prefix = os.path.join("models", f"{model_prefix}_last")
-
-    def _set_epsilon(ep_idx: int) -> float:
-        if not use_eps_schedule:
-            return float(agent.balanced.epsilon)
-        if episodes <= 1:
-            return eps_lo
-        t = ep_idx / max(1, episodes - 1)
-        return eps_hi + (eps_lo - eps_hi) * t
+    meta_path = os.path.join("models", f"{model_prefix}_best.meta.json")
+    ckpt = max(1, int(checkpoint_every))
+    steps_per_episode = max_steps or env.total_steps - TrainingConfig.WINDOW_SIZE
 
     for episode in range(start_ep, episodes):
-        if use_eps_schedule:
-            ep_val = _set_epsilon(episode)
+        if use_eps_schedule and episodes > 1:
+            t = episode / max(episodes - 1, 1)
+            eps = eps_hi + (eps_lo - eps_hi) * t
             for sa in agent.agents:
-                sa.epsilon = ep_val
-
-        if freeze_until > 0 and episode == freeze_until:
-            print(f"Unfreezing at episode {episode}")
-            for sa in agent.agents:
-                for p in sa.policy_net.parameters():
-                    p.requires_grad = True
-                sa.optimizer = torch.optim.Adam(sa.policy_net.parameters(), lr=1e-7)
+                sa.epsilon = eps
 
         state = env.reset()
         total_reward = 0.0
-        steps_per_episode = int(env.total_steps)
-        if max_steps:
-            steps_per_episode = min(steps_per_episode, int(max_steps))
+        dummy_ids = torch.zeros((env.num_envs, 64), dtype=torch.long, device=device)
+        dummy_mask = torch.ones((env.num_envs, 64), dtype=torch.long, device=device)
+        dummy_ids_np = dummy_ids[0].cpu().numpy()
+        dummy_mask_np = dummy_mask[0].cpu().numpy()
 
-        pbar = tqdm(range(steps_per_episode), desc=f"Ep{episode+1}/{episodes}", leave=False)
+        pbar = tqdm(range(steps_per_episode), desc=f"Bearish ep {episode+1}/{episodes}", leave=False)
         for step_idx in pbar:
             actions = agent.batch_act(state, dummy_ids, dummy_mask)
             next_state, rewards, dones, _ = env.step(actions)
@@ -293,51 +248,21 @@ def train(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fine-tune swing model on spread PnL")
+    ap = argparse.ArgumentParser(description="Train bearish options model (put debit / bear call)")
     ap.add_argument("--watchlist", default=DEFAULT_WATCHLIST)
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--max-steps", type=int, default=0)
-    ap.add_argument("--train-every", type=int, default=32)
-    ap.add_argument("--store-every", type=int, default=32)
-    ap.add_argument("--log-dir", default="logs/runs/options_from_swing")
-    ap.add_argument(
-        "--init-from", default="",
-        help="Checkpoint prefix (default: deployed OPTIONS_MODEL_PATH, else swing)",
-    )
-    ap.add_argument(
-        "--no-swing-init", action="store_true",
-        help="Do not fall back to SWING_MODEL_PATH if OPTIONS_MODEL_PATH is missing",
-    )
+    ap.add_argument("--init-from", default="", help="Default: deployed OPTIONS_MODEL_PATH prefix")
     ap.add_argument("--no-resume-latest", action="store_true")
-    ap.add_argument("--freeze-ratio", type=float, default=0.3)
-    ap.add_argument("--initial-epsilon", type=float, default=0.15,
-                    help="Start epsilon (exploration); with --final-epsilon, linear decay to that value")
-    ap.add_argument("--epsilon-decay", type=float, default=0.995,
-                    help="Per-episode multiply when --final-epsilon is not set")
-    ap.add_argument("--final-epsilon", type=float, default=None,
-                    help="If set, linearly decay epsilon from --initial-epsilon to this value over all episodes")
     ap.add_argument("--model-prefix", default=MODEL_PREFIX)
-    ap.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=5,
-        help="Save ep{N} every N episodes (always saves best + last each episode)",
-    )
+    ap.add_argument("--checkpoint-every", type=int, default=5)
     args = ap.parse_args()
 
     train(
         watchlist_path=args.watchlist,
         episodes=args.episodes,
         max_steps=args.max_steps or None,
-        train_every=args.train_every,
-        store_every=args.store_every,
-        log_dir=args.log_dir,
-        init_from_swing=not args.no_swing_init,
         init_from=args.init_from or None,
-        freeze_ratio=args.freeze_ratio,
-        initial_epsilon=args.initial_epsilon,
-        epsilon_decay=args.epsilon_decay,
-        final_epsilon=args.final_epsilon,
         resume_latest=not args.no_resume_latest,
         model_prefix=args.model_prefix,
         checkpoint_every=args.checkpoint_every,
