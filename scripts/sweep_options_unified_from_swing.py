@@ -229,7 +229,8 @@ def main():
     ap.add_argument("--no-spy-filter", action="store_true")
     ap.add_argument("--prefix", default=MODEL_PREFIX)
     ap.add_argument("--disk-cache", action="store_true")
-    ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--cpu", action="store_true",
+                    help="Force CPU inference (inflates returns ~30pts; do not use for deploy research)")
     ap.add_argument(
         "--only", default="",
         help="Comma-separated labels (ep50, best, …). Default: all discovered checkpoints",

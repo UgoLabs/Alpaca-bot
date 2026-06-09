@@ -742,7 +742,7 @@ def run(
     model_path="models/swing_gen7_refined_ep380",
     test_start_date="2024-01-01",
     test_end_date=None,
-    capital=100_000.0,
+    capital=10_000.0,
     max_positions=10,
     confidence_threshold=0.50,
     sell_confidence_threshold=0.0,
@@ -941,7 +941,7 @@ if __name__ == "__main__":
     ap.add_argument("model_path", nargs="?", default="models/swing_gen7_refined_ep380")
     ap.add_argument("--test-start-date", default="2024-01-01")
     ap.add_argument("--test-end-date", default=None)
-    ap.add_argument("--capital", type=float, default=100_000.0)
+    ap.add_argument("--capital", type=float, default=10_000.0)
     ap.add_argument("--max-positions", type=int, default=SwingTraderConfig.MAX_POSITIONS)
     ap.add_argument("--confidence-threshold", type=float, default=SwingTraderConfig.CONFIDENCE_THRESHOLD)
     ap.add_argument("--sell-confidence-threshold", type=float,
@@ -996,7 +996,11 @@ if __name__ == "__main__":
     ap.add_argument("--spy-fear-pct", type=float, default=SwingTraderConfig.SPY_FEAR_BLOCK_PCT)
     ap.add_argument("--spy-sweep", action="store_true",
                     help="Compare portfolio with vs without SPY fear filter")
+    ap.add_argument("--cpu", action="store_true",
+                    help="Force CPU inference (do not use for deploy research; GPU is live path)")
     args = ap.parse_args()
+    if args.cpu:
+        os.environ["BT_FORCE_CPU"] = "1"
     watchlist = args.watchlist if os.path.exists(args.watchlist) else None
     spy_pct = float(args.spy_fear_pct) if args.spy_filter else None
     winner_trail = SwingTraderConfig.ENABLE_WINNER_TRAIL

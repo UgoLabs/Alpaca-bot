@@ -53,17 +53,29 @@ class NewsFetcher:
                 print(f"   📋 Loaded {len(self._cache)} cached news entries from disk.")
             except Exception as e:
                 print(f"   ⚠️ Failed to load news cache: {e}")
+                try:
+                    bad = self.cache_file + ".bad"
+                    if os.path.exists(bad):
+                        os.remove(bad)
+                    os.replace(self.cache_file, bad)
+                    print(f"   ↳ Renamed corrupt cache to {bad}; starting fresh.")
+                except OSError:
+                    pass
+                self._cache = {}
+                self._cache_timestamp = {}
 
     def _save_cache(self):
-        """Save cache to disk."""
+        """Save cache to disk (atomic write to avoid truncated JSON on crash)."""
         try:
-            with open(self.cache_file, 'w') as f:
-                json.dump({
-                    'news': self._cache,
-                    'timestamps': self._cache_timestamp
-                }, f)
-        except Exception as e:
-            # excessive printing can clog logs, ignore
+            os.makedirs(os.path.dirname(self.cache_file) or ".", exist_ok=True)
+            tmp = self.cache_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"news": self._cache, "timestamps": self._cache_timestamp},
+                    f,
+                )
+            os.replace(tmp, self.cache_file)
+        except Exception:
             pass
         
     def prefetch_news(self, symbols: List[str]):

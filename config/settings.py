@@ -65,9 +65,9 @@ class SwingTraderConfig:
 
     WATCHLIST = "swing_liquid.txt"  # ~500 liquid names (build via scripts/build_liquid_watchlist.py)
     MAX_POSITIONS = 40           # Portfolio sweep (2024+ OOS): 40 slots beat 20/30 on return & Sharpe
-    # Buy re-sweep (2024-01-01+, 500-name swing_liquid, temp 0.01, sell 0.35, refreshed CSVs):
-    # 0.50 -> +103.3% vs SPY +56.6% (alpha +46.6%), Sharpe 2.74, max DD -14.0%.
-    # 0.70 (prior live) -> +53.1%, alpha -3.5%. Loosening buy captures more edge on current data.
+    # 0.50/0.35 on GPU (2024-01-01+, swing_liquid, 10bps/side): +93.5%, Sharpe 2.56, 320 trades.
+    # --cpu inflates to ~+101%; use GPU for backtest/sweep (matches live bot inference).
+    # 0.70 (prior live) -> ~+53%, underperforms 0.50 buy on current data.
     CONFIDENCE_THRESHOLD = 0.50
     SELL_CONFIDENCE_THRESHOLD = 0.35  # Sell sweep (40 slots): best Sharpe at 0.35; unchanged in buy re-sweep
 
@@ -99,13 +99,15 @@ class OptionsTraderConfig:
     Credentials: OPTIONS_API_KEY / OPTIONS_API_SECRET (legacy: DAY_API_*).
     """
 
-    WATCHLIST = "options_liquid_200.txt"  # Live scan (top 200 $ vol; matches training)
-    TRAIN_WATCHLIST = "options_liquid_200.txt"  # Options fine-tune / marks download
-    MAX_POSITIONS = 40               # Sweep winner ep30 @ 0.80 (+69.1%); live conf lowered for activity
-    # Unified eps06 OOS (200-symbol, Feb 2024+): buy 0.65 / sell 0.35 -> +48.1%, Sharpe 0.67, 683 opens.
-    # Short 20-symbol best was 0.65/0.50 (+40.4%, Sharpe 1.19). Full universe needs lower sell thresh.
-    CONFIDENCE_THRESHOLD = 0.65
-    SELL_CONFIDENCE_THRESHOLD = 0.35
+    WATCHLIST = "swing_liquid.txt"  # Full 500-name liquid universe (parity with swing bot)
+    TRAIN_WATCHLIST = "swing_liquid.txt"  # Options marks download + training universe
+    MAX_POSITIONS = 40
+    # 500-symbol OOS (Feb 2024+, swing_liquid, SPY filter, eps06_best, 494/500 marks):
+    # 0.60/0.50 on GPU: +72.2%, Sharpe 0.78, max DD -38.1%, 1286 opens (backtest = sweep w/o --cpu).
+    # Sweep with --cpu inflates to ~+103%; do not use --cpu for threshold research.
+    # Prior prod (200 sym, 0.65/0.35): +48.4%.
+    CONFIDENCE_THRESHOLD = 0.60
+    SELL_CONFIDENCE_THRESHOLD = 0.50
     # Softmax temperature for the confidence value ONLY (action selection is unchanged).
     # Q-gap measurement (scripts/measure_q_gap.py, ep30 BUY picks): median top1-top2 Q gap
     # ~0.0066, so at temp=0.01 BUY confidence already spans ~0.37-0.85 (p25-p90 0.50-0.75),
@@ -126,7 +128,7 @@ class OptionsTraderConfig:
     SCAN_INTERVAL_SECONDS = 3600      # Same default as swing live loop (5 min)
     DATA_FEED = "iex"
     DATA_MAX_AGE_HOURS = 20
-    WAKE_BEFORE_OPEN_MINUTES = 90       # 200 symbols: CSV + option marks + snapshots + features
+    WAKE_BEFORE_OPEN_MINUTES = 90       # 500 symbols: CSV + option marks + snapshots + features
     PREMARKET_DOWNLOAD_WORKERS = 6
     PREMARKET_FETCH_WORKERS = 10        # Parallel fetch_and_process before open
     PREMARKET_ONLY_FETCH = True         # No bulk download/fetch during session scans

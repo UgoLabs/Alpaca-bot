@@ -87,6 +87,10 @@ class MultiModalTrader:
         # 2. Configuration
         self.symbols = self._load_watchlist()
 
+        # Pre-open scan cache — init before _maybe_initial_data_update (clock check reads these).
+        self._premarket_scan_cache: list | None = None
+        self._premarket_scan_day: date | None = None
+
         # 6. Swing CSV refresh — defer to pre-open window when market is closed
         if self.mode in ('swing', 'paper_swing', 'options'):
             self._maybe_initial_data_update()
@@ -244,10 +248,6 @@ class MultiModalTrader:
         # Alpaca asset metadata cache (fractionable flag for order routing).
         self._fractionable_cache: dict[str, bool] = {}
 
-        # Pre-open scan cache (snapshots + per-symbol features); used when PREMARKET_ONLY_FETCH.
-        self._premarket_scan_cache: list | None = None
-        self._premarket_scan_day: date | None = None
-        
         print(f"✅ Bot Ready. Watching {len(self.symbols)} symbols.")
 
     def _preopen_lead_seconds(self) -> int:
